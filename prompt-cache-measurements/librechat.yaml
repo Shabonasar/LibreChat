@@ -1,0 +1,119 @@
+# librechat.yaml for the measurement kit: Anthropic + OpenAI (Responses API) / Kimi / Z.ai custom endpoints, all through the logging proxy (service "capture"),
+# three MCP servers (same local server under three names), web search (unreachable stub, only the tool definition matters), no memory.
+# Replace <KIMI_PATH> and <ZAI_PATH> with the path part of the provider base URL (the origin goes to KIMI_BASE_URL / ZAI_BASE_URL in .env).
+# STABLE_CONTEXT is substituted by run.sh (true for stack/replay arms; the promptCache block is removed for the dev arm).
+version: 1.3.17
+cache: true
+interface:
+  agents:
+    use: true
+    create: true
+    share: false
+    public: false
+  prompts:
+    use: false
+    create: false
+  mcpServers:
+    use: true
+    create: false
+  remoteAgents:
+    use: false
+  marketplace:
+    use: false
+  modelSelect: true
+  parameters: true
+  presets: true
+  bookmarks: false
+  runCode: false
+  webSearch: true
+  fileSearch: false
+  temporaryChat: true
+webSearch:
+  searchProvider: "searxng"
+  searxngInstanceUrl: "http://web-stub:8080"
+  searxngApiKey: "stub"
+  scraperProvider: "firecrawl"
+  firecrawlApiUrl: "http://web-stub:8080"
+  firecrawlApiKey: "stub"
+  rerankerType: "jina"
+  jinaApiKey: "stub"
+  jinaApiUrl: "http://web-stub:8080"
+  safeSearch: 0
+  allowedAddresses:
+    - "web-stub:8080"
+endpoints:
+  all:
+    streamRate: 15
+    titleConvo: false
+  agents:
+    promptCache:
+      stableContext: STABLE_CONTEXT
+    capabilities:
+      - web_search
+      - tools
+      - context
+  anthropic:
+    streamRate: 15
+    titleConvo: false
+    headers:
+      x-lc-arm: "${ARM}"
+      x-lc-conversation: "{{LIBRECHAT_BODY_CONVERSATIONID}}"
+  custom:
+    - name: "OpenAI"
+      apiKey: "${OPENAI_API_KEY}"
+      baseURL: "http://capture:8081/v1"
+      headers:
+        x-lc-arm: "${ARM}"
+        x-lc-conversation: "{{LIBRECHAT_BODY_CONVERSATIONID}}"
+      models:
+        default:
+          - "gpt-5.4-nano"
+          - "gpt-5.4-mini"
+        fetch: false
+      titleConvo: false
+      customParams:
+        defaultParamsEndpoint: openAI
+        paramDefinitions:
+          - key: useResponsesApi
+            default: true
+    - name: "Kimi"
+      apiKey: "${KIMI_API_KEY}"
+      baseURL: "http://capture:8082/<KIMI_PATH>"
+      headers:
+        x-lc-arm: "${ARM}"
+        x-lc-conversation: "{{LIBRECHAT_BODY_CONVERSATIONID}}"
+      models:
+        default:
+          - "kimi-for-coding"
+        fetch: false
+      titleConvo: false
+    - name: "Z.ai"
+      apiKey: "${ZAI_API_KEY}"
+      baseURL: "http://capture:8083/<ZAI_PATH>"
+      headers:
+        x-lc-arm: "${ARM}"
+        x-lc-conversation: "{{LIBRECHAT_BODY_CONVERSATIONID}}"
+      models:
+        default:
+          - "glm-5.2"
+        fetch: false
+      titleConvo: false
+mcpSettings:
+  allowedDomains:
+    - "mcp-big"
+mcpServers:
+  bigtool:
+    type: streamable-http
+    url: "http://mcp-big:3000/mcp"
+    title: "Big report"
+    timeout: 60000
+  bigtool2:
+    type: streamable-http
+    url: "http://mcp-big:3000/mcp"
+    title: "Big report 2"
+    timeout: 60000
+  bigtool3:
+    type: streamable-http
+    url: "http://mcp-big:3000/mcp"
+    title: "Big report 3"
+    timeout: 60000

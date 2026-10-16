@@ -1,0 +1,72 @@
+# Measurement stand: LibreChat -> capture (logging proxy) -> provider API. Driven by run.sh (sets ARM, SRC_DIR, key files, LC_UID/LC_GID).
+# Optional egress through an HTTP proxy: export HTTPS_PROXY=... NODE_USE_ENV_PROXY=1 before run.sh (only the capture service uses it).
+name: lc-repro
+services:
+  mongo:
+    image: mongo:7
+    container_name: lc-repro-mongo
+    restart: unless-stopped
+    command: ["mongod", "--noauth", "--bind_ip", "0.0.0.0"]
+    volumes:
+      - ./data/mongo:/data/db
+  api:
+    image: node:24-alpine
+    container_name: lc-repro-api
+    restart: "no"
+    user: "${LC_UID:-1000}:${LC_GID:-1000}"
+    working_dir: /app
+    depends_on: [mongo, capture, mcp-big, web-stub]
+    # Keys are read from read-only mounted files at process start: not in env files, yaml or docker inspect
+    command: ["sh", "-c", "for p in anthropic openai kimi zai; do v=$$(echo $$p | tr a-z A-Z)_API_KEY; export $$v=\"$$(cat /run/$$p.key)\"; done; exec node api/server/index.js"]
+    env_file: .env
+    environment:
+      HOME: /tmp
+      ARM: ${ARM:?set ARM}
+      CONFIG_PATH: /config/librechat.yaml
+      ANTHROPIC_REVERSE_PROXY: http://capture:8080
+      ANTHROPIC_MODELS: ${ANTHROPIC_MODELS:-claude-haiku-5-5,claude-sonnet-5-5,claude-opus-5-5}
+    ports:
+      - "127.0.0.1:${LC_PORT:-13184}:3080"
+    volumes:
+      - ${SRC_DIR:?set SRC_DIR}:/app
+      - ${ANTHROPIC_KEY_FILE:-/dev/null}:/run/anthropic.key:ro
+      - ${OPENAI_KEY_FILE:-/dev/null}:/run/openai.key:ro
+      - ${KIMI_KEY_FILE:-/dev/null}:/run/kimi.key:ro
+      - ${ZAI_KEY_FILE:-/dev/null}:/run/zai.key:ro
+      - ./librechat.active.yaml:/config/librechat.yaml:ro
+      - ./data/logs:/app/api/logs
+      - ./data/uploads:/app/uploads
+      - ./data/images:/app/client/public/images
+  capture:
+    image: node:24-alpine
+    container_name: lc-repro-capture
+    restart: unless-stopped
+    user: "${LC_UID:-1000}:${LC_GID:-1000}"
+    command: ["node", "/kit/capture.js"]
+    environment:
+      OUT_DIR: /data/proxy
+      # port=provider=upstream origin; the path comes from the baseURL in librechat.yaml
+      ROUTES: "8080=anthropic=${ANTHROPIC_BASE_URL:-https://api.anthropic.com},8081=openai=${OPENAI_BASE_URL:-https://api.openai.com},8082=kimi=${KIMI_BASE_URL:-https://kimi-base-url.invalid},8083=zai=${ZAI_BASE_URL:-https://zai-base-url.invalid}"
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NODE_USE_ENV_PROXY: ${NODE_USE_ENV_PROXY:-}
+      NO_PROXY: localhost,127.0.0.1,api
+    volumes:
+      - ./capture.js:/kit/capture.js:ro
+      - ./data/proxy:/data/proxy
+  mcp-big:
+    image: node:24-alpine
+    container_name: lc-repro-mcp-big
+    restart: unless-stopped
+    user: "${LC_UID:-1000}:${LC_GID:-1000}"
+    command: ["node", "/kit/mcp-big.cjs"]
+    environment:
+      # the MCP SDK and zod come from the LibreChat tree
+      NODE_PATH: /app/node_modules
+    volumes:
+      - ${SRC_DIR:?set SRC_DIR}:/app:ro
+      - ./mcp-big.cjs:/kit/mcp-big.cjs:ro
+  web-stub:
+    image: node:24-alpine
+    container_name: lc-repro-web-stub
+    restart: unless-stopped
+    command: ["node", "-e", "require('http').createServer((q, r) => r.end('{}')).listen(8080)"]
