@@ -49,6 +49,8 @@ All prompts avoid asking the model about its own reasoning (such prompts get ref
 - G2: 8 turns with web search and three MCP servers toggled per turn (different subsets and order, one turn without web search); G2O1 / G2O2: 2 turns with all three servers enabled in a different order.
 - G3: compaction, 12 turns with tool calls and growing history, `maxContextTokens` 12000 (default) or 32000 (`G3_CTX=32000`) so summarization triggers.
 - tools: 8 turns, Anthropic only, thinking on. The model plans and calls `fetch_report` of `bigtool` on turns 2, 4 and 5 (several calls per turn); LibreChat is restarted after turn 4.
+- G4 (code interpreter): 6 turns, Anthropic only, thinking on. Code on an uploaded csv, MCP `fetch_report`, two chained bash calls where the second reads the first output through a `{{toolNturnM}}` reference, LibreChat restart after turn 3, code on a second csv, a probe of an old reference, a plain turn. Needs a Code API (not shipped): set `LIBRECHAT_CODE_BASEURL` (plus the key or JWT variables your Code API needs) in `.env`; the api container must reach it. The meaningful comparison is the same tree without vs with LibreChat-AI/agents#629 built into `AGENTS_SDK`.
+- handoff: two agents (coordinator and report specialist) with handoff edges created through the API, 6 turns, turns 2 and 4 handed over to the specialist, which calls `fetch_report`. Claude drops the other agent's thinking blocks (`input_transformations`); expected, no cache effect. Memory agent is not part of it.
 
 ## Run
 
@@ -57,19 +59,25 @@ All prompts avoid asking the model about its own reasoning (such prompts get ref
 ./run.sh g openai "dev stack" gpt-5.4-nano low g3                       # one set: full | smoke | g2 | g3
 ./run.sh g kimi "dev stack"; ./run.sh g zai "dev stack"
 ./run.sh tools claude-haiku-5-5 "dev stack replay"                      # "tools" scenario
+./run.sh g4 claude-haiku-5-5 "stack"                                    # needs LIBRECHAT_CODE_BASEURL in .env
+./run.sh handoff claude-haiku-5-5 "dev stack replay"
+./run.sh tools claude-haiku-5-5 "stack" --ttl 1h                        # --ttl 5m|1h (default 5m) works with g, tools, g4, handoff
 ```
 
-`run.sh up <arm>` / `restart` / `down` / `status` / `logs` / `create-user` are available for manual work. Run files go to `runs-g/` and `runs-tools/`, summaries to `results-g/` and `results-tools/` (written by the run itself).
+TTL: `--ttl` is sent as `promptCacheTtl` in the Anthropic presets and agents (the other providers ignore it). The measurements in #17102 for G4 used 5m. Compare arms with the same TTL.
+
+`run.sh up <arm>` / `restart` / `down` / `status` / `logs` / `create-user` are available for manual work. Run files go to `runs-g/`, `runs-tools/`, `runs-g4/`, `runs-handoff/`, summaries to the matching `results-*/` (written by the run itself).
 
 ## Analyze
 
 ```
 python3 -I analyze_g.py runs-g/<file>.json ... --md results-g/out.md     # one row per conversation: share, misses, uncached, output, cost; per-request detail below
 python3 -I analyze_tools.py runs-tools/<file>.json                        # per-request table of the tools run
+python3 -I analyze_g4.py runs-g4/<file>.json [--out-dir results-g4]       # G4 and handoff: per request share, misses, dropped thinking blocks, [ref: toolNturnM] labels, first differing byte
 ```
 
 `PRICES` in `analyze_g.py` is a small price table for the cost column; adjust it to the current price list. Compare arms on the same provider, model and effort; read share, misses and uncached together (a high share on a larger prompt can still mean more uncached tokens).
 
 ## Files
 
-`run.sh` runner and stand control, `build.sh` tree build, `docker-compose.yml`, `librechat.yaml`, `.env.example`, `capture.js` logging proxy, `mcp-big.cjs` MCP server, `e2e.py` LibreChat HTTP helpers, `g_scenarios.py` G scenarios, `run_g.py` G runner, `run_tools.py` tools scenario, `analyze_g.py`, `analyze_tools.py`.
+`run.sh` runner and stand control, `build.sh` tree build, `docker-compose.yml`, `librechat.yaml`, `.env.example`, `capture.js` logging proxy, `mcp-big.cjs` MCP server, `e2e.py` LibreChat HTTP helpers, `g_scenarios.py` G scenarios, `run_g.py` G runner, `run_tools.py` tools scenario, `run_g4.py` G4 scenario, `run_handoff.py` handoff scenario, `data-files/` synthetic csv files for G4, `analyze_g.py`, `analyze_tools.py`, `analyze_g4.py`.

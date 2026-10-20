@@ -1,0 +1,5 @@
+sensor_id,reading_m3,status
+S-44,120.5,ok
+S-45,98.2,warn
+S-46,134.9,ok
+S-47,77.1,ok

@@ -2,6 +2,7 @@
 """LibreChat HTTP helpers: login, send one chat turn through /api/agents/chat and wait until it finishes. Stdlib only."""
 import datetime
 import json
+import mimetypes
 import os
 import subprocess
 import time
@@ -61,9 +62,9 @@ def iso_now():
     return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds")
 
 
-def send_turn(token, conv_id, parent_id, text, artifacts, preset=None):
+def send_turn(token, conv_id, parent_id, text, artifacts, preset=None, files=None, execute_code=False):
     msg_id = str(uuid.uuid4())
-    ephemeral = {"mcp": list(PROVIDER.get("mcp", [])), "web_search": bool(PROVIDER.get("web")), "file_search": False, "execute_code": False}
+    ephemeral = {"mcp": list(PROVIDER.get("mcp", [])), "web_search": bool(PROVIDER.get("web")), "file_search": False, "execute_code": execute_code}
     if artifacts:
         ephemeral["artifacts"] = "default"
     body = {
@@ -85,6 +86,8 @@ def send_turn(token, conv_id, parent_id, text, artifacts, preset=None):
         "timezone": "UTC",
         "clientRequestId": str(uuid.uuid4()),
     }
+    if files:
+        body["files"] = files
     path = "/api/agents/chat/" + urllib.parse.quote(PROVIDER["endpoint"], safe="")
     t0 = iso_now()
     status, data = request("POST", path, body, token)
@@ -128,4 +131,24 @@ def send_turn(token, conv_id, parent_id, text, artifacts, preset=None):
         "reply_chars": len(json.dumps(reply.get("content") or reply.get("text") or "")),
         "error": bool(reply.get("error")),
         "unfinished": bool(reply.get("unfinished")),
+        "reply_text": json.dumps(reply.get("content") or "", ensure_ascii=False)[:1500],
     }
+
+
+def upload(token, path, tool_resource, conv_id, endpoint="anthropic"):
+    boundary = uuid.uuid4().hex
+    fields = [("endpoint", endpoint), ("endpointType", endpoint), ("file_id", str(uuid.uuid4())), ("message_file", "true"), ("conversationId", conv_id)]
+    if tool_resource:
+        fields.append(("tool_resource", tool_resource))
+    body = b"".join(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode() for k, v in fields)
+    name = os.path.basename(path)
+    mime = mimetypes.guess_type(name)[0] or "text/plain"
+    body += f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{urllib.parse.quote(name)}"\r\nContent-Type: {mime}\r\n\r\n'.encode()
+    body += open(path, "rb").read() + f"\r\n--{boundary}--\r\n".encode()
+    headers = {"User-Agent": UA, "Authorization": f"Bearer {token}", "Content-Type": f"multipart/form-data; boundary={boundary}", "Accept": "application/json"}
+    req = urllib.request.Request(BASE + "/api/files", data=body, method="POST", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as err:
+        raise RuntimeError(f"upload {name} {err.code}: {err.read()[:300]!r}")

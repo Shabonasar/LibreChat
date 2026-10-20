@@ -82,6 +82,7 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=2048)
     ap.add_argument("--turns", type=int, default=8)
     ap.add_argument("--tag", default="")
+    ap.add_argument("--ttl", default="5m", choices=["5m", "1h"], help="promptCacheTtl")
     ap.add_argument("--scenario", default="tools", choices=["base", "tools"])
     args = ap.parse_args()
     env = e2e.load_env()
@@ -96,6 +97,7 @@ def main():
         "effort": args.effort,
         "thinkingDisplay": args.display,
         "promptCache": True,
+        "promptCacheTtl": args.ttl,
         # per-run label first, so arms never read each other's cache
         "promptPrefix": f"Run label: {args.arm}-{uuid.uuid4().hex[:8]}. " + SYSTEM,
     }
@@ -105,7 +107,7 @@ def main():
     conv_id = str(uuid.uuid4())
     parent = e2e.NO_PARENT
     run = {"arm": args.arm, "commit": e2e.git_commit(args.arm), "model": args.model, "effort": args.effort, "display": args.display,
-           "max_tokens": args.max_tokens, "scenario": args.scenario, "started": e2e.iso_now(), "conversation_id": conv_id, "turns": [], "restart_after": RESTART_AFTER}
+           "max_tokens": args.max_tokens, "ttl": args.ttl, "scenario": args.scenario, "started": e2e.iso_now(), "conversation_id": conv_id, "turns": [], "restart_after": RESTART_AFTER}
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     os.makedirs(f"{e2e.KIT}/runs-tools", exist_ok=True)
     out = f"{e2e.KIT}/runs-tools/{args.arm}-{args.model}{'-' + args.scenario if args.scenario != 'base' else ''}{'-' + args.tag if args.tag else ''}-{stamp}.json"

@@ -1,4 +1,5 @@
 # librechat.yaml for the measurement kit: Anthropic + OpenAI (Responses API) / Kimi / Z.ai custom endpoints, all through the logging proxy (service "capture"),
+# code execution (execute_code capability; needs an external Code API, see LIBRECHAT_CODE_BASEURL in .env.example, used only by G4),
 # three MCP servers (same local server under three names), web search (unreachable stub, only the tool definition matters), no memory.
 # Replace <KIMI_PATH> and <ZAI_PATH> with the path part of the provider base URL (the origin goes to KIMI_BASE_URL / ZAI_BASE_URL in .env).
 # STABLE_CONTEXT is substituted by run.sh (true for stack/replay arms; the promptCache block is removed for the dev arm).
@@ -24,7 +25,7 @@ interface:
   parameters: true
   presets: true
   bookmarks: false
-  runCode: false
+  runCode: true
   webSearch: true
   fileSearch: false
   temporaryChat: true
@@ -52,6 +53,7 @@ endpoints:
       - web_search
       - tools
       - context
+      - execute_code
   anthropic:
     streamRate: 15
     titleConvo: false

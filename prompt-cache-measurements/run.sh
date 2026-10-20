@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # usage: run.sh up <dev|stack|replay> | restart | down | status | logs [n] | create-user
 #        run.sh g <anthropic|openai|kimi|zai> "<arms>" [model] [effort] [full|smoke|g2|g3]
-#        run.sh tools [model] ["<arms>"]
+#        run.sh tools|g4|handoff [model] ["<arms>"]     (g4 needs a Code API: LIBRECHAT_CODE_BASEURL in .env)
+# Option --ttl 5m|1h (anywhere in the arguments, default 5m): promptCacheTtl of the Anthropic presets and agents.
 # Trees: $SRC_ROOT/src-<arm> (default: next to this script). Keys: files in $KEYS_DIR (default ./keys): anthropic.key, openai.key, kimi.key, zai.key.
 # Optional egress proxy for the capture service: export HTTPS_PROXY=... NODE_USE_ENV_PROXY=1 (passed through by docker-compose.yml).
 # Optional extra compose file (e.g. a fixed network subnet): export COMPOSE_OVERRIDE=/path/override.yml.
@@ -18,6 +19,15 @@ for p in anthropic openai kimi zai; do
   [ -f "$f" ] || f=/dev/null
   export "$v=$f"
 done
+TTL=5m; ARGV=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --ttl) TTL="${2:?--ttl needs 5m or 1h}"; shift 2 ;;
+    *) ARGV+=("$1"); shift ;;
+  esac
+done
+[ "$TTL" = 5m ] || [ "$TTL" = 1h ] || { echo "--ttl: 5m or 1h"; exit 1; }
+set -- ${ARGV[@]+"${ARGV[@]}"}
 dc() { docker compose -p lc-repro -f "$KIT/docker-compose.yml" ${COMPOSE_OVERRIDE:+-f "$COMPOSE_OVERRIDE"} "$@"; }
 ready() {
   for i in $(seq 1 60); do
@@ -65,7 +75,7 @@ case "${1:-}" in
       "$0" up "$ARM"
       "$0" create-user >/dev/null 2>&1 || true
       LABEL="$ARM-$(python3 -I -c 'import uuid; print(uuid.uuid4().hex[:8])')"
-      G="python3 -I run_g.py --arm $ARM --provider $PROVIDER --effort $EFFORT --label $LABEL ${MODEL:+--model $MODEL}"
+      G="python3 -I run_g.py --arm $ARM --provider $PROVIDER --effort $EFFORT --ttl $TTL --label $LABEL ${MODEL:+--model $MODEL}"
       if [ "$SET" = smoke ]; then
         $G --scenarios G1B 2>&1 | tee "logs/g-$PROVIDER-$ARM-smoke-$STAMP.log"
       elif [ "$SET" = g2 ]; then
@@ -84,15 +94,22 @@ case "${1:-}" in
     FILES=$(find runs-g -name "$PROVIDER-*.json" -newer "logs/.g-start-$STAMP" 2>/dev/null || true)
     python3 -I analyze_g.py $FILES --md "results-g/$PROVIDER-$SET-$STAMP.md" | head -20
     echo "results: results-g/$PROVIDER-$SET-$STAMP.md" ;;
-  tools)
-    MODEL="${2:-claude-haiku-5-5}"; ARMS="${3:-dev stack replay}"
+  tools|g4|handoff)
+    SC="$1"; MODEL="${2:-claude-haiku-5-5}"; ARMS="${3:-dev stack replay}"
+    if [ "$SC" = g4 ]; then
+      grep -q "^LIBRECHAT_CODE_BASEURL=." "$KIT/.env" || { echo "g4: set LIBRECHAT_CODE_BASEURL (and the keys your Code API needs) in .env"; exit 1; }
+    fi
     trap cleanup EXIT
     for ARM in $ARMS; do
-      echo "=== $ARM"
+      echo "=== $SC $ARM"
       "$0" up "$ARM"
       "$0" create-user >/dev/null 2>&1 || true
-      python3 -I run_tools.py --arm "$ARM" --model "$MODEL" --scenario tools
+      case "$SC" in
+        tools) python3 -I run_tools.py --arm "$ARM" --model "$MODEL" --ttl "$TTL" --scenario tools ;;
+        g4) python3 -I run_g4.py --arm "$ARM" --model "$MODEL" --ttl "$TTL" ;;
+        handoff) python3 -I run_handoff.py --arm "$ARM" --model "$MODEL" --ttl "$TTL" ;;
+      esac
     done
-    ls -t results-tools/*-"$MODEL"-*.md | head -3 ;;
+    ls -t results-$SC/*-"$MODEL"-*.md | head -3 ;;
   *) echo "usage: see header"; exit 1 ;;
 esac
