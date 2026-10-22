@@ -21,7 +21,7 @@ All numbers come from the provider usage records captured between LibreChat and 
 
 An arm is a LibreChat checkout in `$SRC_ROOT/src-<arm>` (default: next to the scripts). `run.sh` removes the `promptCache` block from the config for `dev` and sets `stableContext: true` for the others. Each run gets a unique `Run label:` in the system prompt, so arms never read each other's cache.
 
-Claude Haiku 5.5 needs LibreChat-AI/LibreChat#17062 applied on every arm, including dev: upstream does not recognize Haiku 5.5 (`thinking.type: enabled` is sent and rejected with 400, and thinking blocks are not bound).
+Claude Haiku 5.5 works on every arm as is: `dev` recognizes it since LibreChat-AI/LibreChat#17201. Measurements taken before that used LibreChat-AI/LibreChat#17062 applied on every arm.
 
 ## Setup
 
@@ -30,7 +30,7 @@ Claude Haiku 5.5 needs LibreChat-AI/LibreChat#17062 applied on every arm, includ
    git clone <LIBRECHAT_REPO> src-<arm> && git -C src-<arm> checkout <LIBRECHAT_BRANCH>
    AGENTS_SDK=<AGENTS_SDK_DIR> ./build.sh <arm>
    ```
-   `<AGENTS_SDK_DIR>` is a built `@librechat/agents` checkout (package.json, dist, node_modules) that replaces the package after `npm ci`; omit it to use the version from the tree. `<LIBRECHAT_BRANCH>` is the branch of the arm (upstream dev, series head, series head with replay) plus #17062 for Haiku 5.5.
+   `<AGENTS_SDK_DIR>` is a built `@librechat/agents` checkout (package.json, dist, node_modules) that replaces the package after `npm ci`; omit it to use the version from the tree. `<LIBRECHAT_BRANCH>` is the branch of the arm (upstream dev, series head, series head with replay).
 2. Config: `cp .env.example .env`, fill secrets and `LC_TEST_PASSWORD`. For Kimi / Z.ai set `KIMI_BASE_URL` / `ZAI_BASE_URL` (origin) in `.env` and put the path part into `librechat.yaml` instead of `<KIMI_PATH>` / `<ZAI_PATH>`.
 3. Keys: one file per provider in `./keys` (`anthropic.key`, `openai.key`, `kimi.key`, `zai.key`; or `*_KEY_FILE` variables). They are mounted read-only and exported inside the container at process start, never written to env files or yaml. Only providers you measure are needed.
 4. Optional egress proxy: `export HTTPS_PROXY=http://<PROXY> NODE_USE_ENV_PROXY=1` before `run.sh`; only the logging proxy container uses it.
