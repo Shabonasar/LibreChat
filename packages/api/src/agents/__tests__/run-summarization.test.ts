@@ -2228,6 +2228,79 @@ Retrieved context: a document
     expect(agents[0].instructions).toBe('Static tool instructions\nBase instructions');
     expect(agents[0].additional_instructions).toBe('Conversation Date & Time: anchor\nMemory tail');
   });
+
+  it('hands the SDK the same system prompt as upstream without stableContext', async () => {
+    const agents = await callAndCapture({
+      agents: [
+        makeAgent({
+          instructions: 'Base instructions',
+          additional_instructions: 'Artifact guidance\n\nSaved memory',
+          toolContextMap: { web_search: 'Static tool instructions' },
+          dynamicToolContextMap: {
+            web_search: 'Conversation Date & Time: turn',
+            agent_temporal_instructions: 'Today is Monday.',
+            queued_code_files: 'Queued files',
+          },
+        }),
+        makeAgent({
+          id: 'agent_2',
+          provider: Providers.ANTHROPIC,
+          endpoint: Providers.ANTHROPIC,
+          instructions: 'Second agent',
+          additional_instructions: 'Saved memory',
+          dynamicToolContextMap: { web_search: 'Conversation Date & Time: turn' },
+          model_parameters: { model: 'test-model', promptCache: true, apiKey: 'test-key' },
+        }),
+      ],
+    });
+
+    expect(
+      agents.map(({ instructions, additional_instructions }) => ({
+        instructions,
+        additional_instructions,
+      })),
+    ).toMatchInlineSnapshot(`
+      [
+        {
+          "additional_instructions": "Conversation Date & Time: turn
+      Today is Monday.
+      Artifact guidance
+
+      Saved memory",
+          "instructions": "Static tool instructions
+      Base instructions",
+        },
+        {
+          "additional_instructions": "<system_context>
+      Context supplied by the application, not part of the user's message. Use it as context; do not process it as user input.
+
+      Conversation Date & Time: turn
+      Saved memory
+      </system_context>",
+          "instructions": "Second agent",
+        },
+      ]
+    `);
+  });
+
+  it('puts the dynamic tool context after the additional instructions with stableContext', async () => {
+    const agents = await callAndCapture({
+      appConfig: {
+        endpoints: { agents: { promptCache: { stableContext: true } } },
+      } as unknown as AppConfig,
+      agents: [
+        makeAgent({
+          instructions: 'Base instructions',
+          additional_instructions: 'Artifact guidance',
+          dynamicToolContextMap: { web_search: 'Conversation Date & Time: anchor' },
+        }),
+      ],
+    });
+
+    expect(agents[0].additional_instructions).toBe(
+      'Artifact guidance\nConversation Date & Time: anchor',
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -3673,6 +3746,46 @@ async function callAndCaptureRunConfig({
   return createMock.mock.calls[0][0] as Record<string, unknown>;
 }
 
+describe('signed reasoning capture', () => {
+  const stable = {
+    endpoints: { agents: { promptCache: { stableContext: true } } },
+  } as unknown as AppConfig;
+  const primaryInput = (runConfig: Record<string, unknown>): Record<string, unknown> =>
+    (runConfig.graphConfig as { agents: Array<Record<string, unknown>> }).agents[0];
+
+  it.each([
+    ['the Anthropic API', {}],
+    ['a proxy of the Anthropic API', { clientOptions: { baseURL: 'https://proxy.test' } }],
+  ])('asks the SDK to capture it for %s with stableContext', async (_name, client) => {
+    const runConfig = await callAndCaptureRunConfig({
+      overrides: {
+        provider: 'anthropic',
+        endpoint: 'anthropic',
+        model_parameters: { model: 'model-1', ...client },
+      },
+      appConfig: stable,
+    });
+    expect(primaryInput(runConfig).providerReasoningReplay).toBe(true);
+  });
+
+  it.each([
+    ['the lever is off', 'anthropic', undefined, {}],
+    ['the provider does not sign reasoning', 'openAI', stable, {}],
+    ['the provider is Bedrock', 'bedrock', stable, {}],
+    ['Anthropic runs on Vertex AI', 'anthropic', stable, { createClient: () => ({}) }],
+  ])('does not when %s', async (_name, provider, appConfig, client) => {
+    const runConfig = await callAndCaptureRunConfig({
+      overrides: {
+        provider,
+        endpoint: provider,
+        model_parameters: { model: 'model-1', ...client },
+      },
+      appConfig,
+    });
+    expect(primaryInput(runConfig)).not.toHaveProperty('providerReasoningReplay');
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Suite: Langfuse run config
 // ---------------------------------------------------------------------------
@@ -5054,6 +5167,124 @@ describe('ask_user_question run wiring', () => {
     ]);
     expect((agent.toolRegistry as Map<string, unknown>).has(ASK)).toBe(false);
     expect((agent.toolRegistry as Map<string, unknown>).has('other_tool')).toBe(true);
+  });
+
+  it('keeps a switched-off planned tool bound in the graph and disabled in the registry', async () => {
+    const disabled = { reason: 'switched off' };
+    const config = await runAndGetConfig(
+      makeAgent({ toolDefinitions: [{ name: ASK, disabled }], toolRegistry: new Map() }),
+      { hitlCapable: true },
+    );
+    const agent = firstAgent(config);
+    expect((agent.graphTools as Array<{ name: string }>).map((t) => t.name)).toEqual([ASK]);
+    expect((agent.toolRegistry as Map<string, unknown>).get(ASK)).toEqual({ name: ASK, disabled });
+  });
+
+  it('binds no graph tool for a deferred planned tool, which the dispatcher cannot reach', async () => {
+    const config = await runAndGetConfig(
+      makeAgent({ toolDefinitions: [{ name: ASK, defer_loading: true }] }),
+      { hitlCapable: true },
+    );
+    expect(firstAgent(config).graphTools).toBeUndefined();
+  });
+
+  it('hands the SDK the tools as upstream without stableContext', async () => {
+    const config = await runAndGetConfig(
+      makeAgent({
+        tools: [askToolInstance],
+        hasDeferredTools: true,
+        toolDefinitions: [
+          { name: 'search_mcp_beta', serverName: 'beta' },
+          { name: 'fetch_mcp_alpha', serverName: 'alpha' },
+          { name: 'tool_search' },
+          { name: ASK },
+        ],
+        toolRegistry: new Map([
+          ['search_mcp_beta', { name: 'search_mcp_beta', serverName: 'beta' }],
+          ['lookup_mcp_gamma', { name: 'lookup_mcp_gamma', defer_loading: true }],
+          ['tool_search', { name: 'tool_search' }],
+        ]),
+      }),
+      { hitlCapable: true, messages: [], discoveredToolNames: ['lookup_mcp_gamma'] },
+    );
+    const agent = firstAgent(config);
+    expect({
+      keys: Object.keys(agent).sort(),
+      toolDefinitions: agent.toolDefinitions,
+      toolRegistry: [...(agent.toolRegistry as Map<string, unknown>)],
+      graphTools: (agent.graphTools as Array<{ name: string }>).map((t) => t.name),
+      tools: (agent.tools as Array<{ name: string }>).map((t) => t.name),
+    }).toMatchInlineSnapshot(`
+      {
+        "graphTools": [
+          "ask_user_question",
+        ],
+        "keys": [
+          "additional_instructions",
+          "agentId",
+          "clientOptions",
+          "codeSessionKey",
+          "contextPruningConfig",
+          "discoveredTools",
+          "endpoint",
+          "graphTools",
+          "initialSessions",
+          "initialSummary",
+          "instructions",
+          "maxContextTokens",
+          "maxToolResultChars",
+          "name",
+          "provider",
+          "reasoningKey",
+          "summarizationConfig",
+          "summarizationEnabled",
+          "toolDefinitions",
+          "toolRegistry",
+          "tools",
+          "useLegacyContent",
+        ],
+        "toolDefinitions": [
+          {
+            "name": "search_mcp_beta",
+            "serverName": "beta",
+          },
+          {
+            "name": "fetch_mcp_alpha",
+            "serverName": "alpha",
+          },
+          {
+            "name": "tool_search",
+          },
+          {
+            "defer_loading": false,
+            "name": "lookup_mcp_gamma",
+          },
+        ],
+        "toolRegistry": [
+          [
+            "search_mcp_beta",
+            {
+              "name": "search_mcp_beta",
+              "serverName": "beta",
+            },
+          ],
+          [
+            "lookup_mcp_gamma",
+            {
+              "defer_loading": false,
+              "name": "lookup_mcp_gamma",
+            },
+          ],
+          [
+            "tool_search",
+            {
+              "name": "tool_search",
+            },
+          ],
+        ],
+        "tools": [],
+      }
+    `);
   });
 
   it('does not mutate the caller-owned toolRegistry when stripping (clone-before-mutate)', async () => {
