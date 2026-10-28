@@ -78,6 +78,8 @@ python3 -I analyze_g4.py runs-g4/<file>.json [--out-dir results-g4]       # G4 a
 
 `PRICES` in `analyze_g.py` is a small price table for the cost column; adjust it to the current price list. Compare arms on the same provider, model and effort; read share, misses and uncached together (a high share on a larger prompt can still mean more uncached tokens).
 
+r13 (2026-10-28): final results are in `results/r13/` (`g/` G1-G3, `tools/` tools and thinking runs; arm `r13f` = `integration/prompt-cache(-dev)` of the series), the pre-reduction test sets of the PRs in `full-tests/`. Both forks (LibreChat and agents) have the integration branch `integration/prompt-cache` with all PR heads.
+
 ## Files
 
 `run.sh` runner and stand control, `build.sh` tree build, `docker-compose.yml`, `librechat.yaml`, `.env.example`, `capture.js` logging proxy, `mcp-big.cjs` MCP server, `e2e.py` LibreChat HTTP helpers, `g_scenarios.py` G scenarios, `run_g.py` G runner, `run_tools.py` tools scenario, `run_g4.py` G4 scenario, `run_handoff.py` handoff scenario, `data-files/` synthetic csv files for G4, `analyze_g.py`, `analyze_tools.py`, `analyze_g4.py`.

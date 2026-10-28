@@ -1,0 +1,2148 @@
+diff --git a/src/__tests__/stream.eagerEventExecution.test.ts b/src/__tests__/stream.eagerEventExecution.test.ts
+index 87536140..3b346c27 100644
+--- a/src/__tests__/stream.eagerEventExecution.test.ts
++++ b/src/__tests__/stream.eagerEventExecution.test.ts
+@@ -5342,20 +5342,30 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
+     expect(graph.eagerEventToolExecutions.has('call_cf2')).toBe(false);
+   });
+ 
+-  it('does not prestart dispatcher calls', async () => {
++  it('does not prestart dispatcher calls, dispatchable tools, or disabled tools', async () => {
+     const graph = createGraph({
+       eagerEventToolExecution: { enabled: true },
+       getAgentContext: jest.fn(() => ({
+         provider: Providers.ANTHROPIC,
+         reasoningKey: 'reasoning',
+-        toolDefinitions: [{ name: 'call_tool' }],
+-        toolDispatch: true,
++        toolDefinitions: [
++          { name: 'weather', disabled: { reason: 'off' } },
++          { name: 'search_wiki', defer_loading: true },
++        ],
++        toolDispatch: { name: 'call_tool' },
+         agentId: 'agent_1',
+       })) as unknown as StandardGraph['getAgentContext'],
+     });
+-    const toolExecute = jest
++    const toolExecuteCalls: t.ToolExecuteBatchRequest[] = [];
++    jest
+       .spyOn(events, 'safeDispatchCustomEvent')
+-      .mockResolvedValue(undefined);
++      .mockImplementation(async (event, data): Promise<void> => {
++        if (event !== GraphEvents.ON_TOOL_EXECUTE) {
++          return;
++        }
++        toolExecuteCalls.push(data as t.ToolExecuteBatchRequest);
++        (data as t.ToolExecuteBatchRequest).resolve([]);
++      });
+ 
+     await new ChatModelStreamHandler().handle(
+       GraphEvents.CHAT_MODEL_STREAM,
+@@ -5366,8 +5376,10 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
+             {
+               id: 'call_dispatch',
+               name: 'call_tool',
+-              args: { name: 'late_tool', arguments: '{"query":"x"}' },
++              args: { name: 'search_wiki', arguments: '{"query":"x"}' },
+             },
++            { id: 'call_off', name: 'weather', args: { city: 'Oslo' } },
++            { id: 'call_direct', name: 'search_wiki', args: { query: 'x' } },
+           ],
+           response_metadata: finalToolCallResponseMetadata,
+         } as unknown as t.StreamChunk,
+@@ -5376,9 +5388,7 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
+       graph
+     );
+ 
+-    expect(
+-      toolExecute.mock.calls.some(([event]) => event === GraphEvents.ON_TOOL_EXECUTE)
+-    ).toBe(false);
++    expect(toolExecuteCalls).toHaveLength(0);
+     expect(graph.eagerEventToolExecutions.size).toBe(0);
+   });
+ 
+diff --git a/src/agents/__tests__/AgentContext.test.ts b/src/agents/__tests__/AgentContext.test.ts
+index 9e2c8a48..2730b5d2 100644
+--- a/src/agents/__tests__/AgentContext.test.ts
++++ b/src/agents/__tests__/AgentContext.test.ts
+@@ -1,5 +1,6 @@
+ // src/agents/__tests__/AgentContext.test.ts
+ import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
++import type { BaseMessage } from '@langchain/core/messages';
+ import type * as t from '@/types';
+ import { markTokenCounterCacheCompatible } from '@/llm/tokenCounterCacheCompatibility';
+ import { buildSummaryCarrierText } from '@/summarization/shared';
+@@ -69,21 +70,6 @@ describe('AgentContext', () => {
+       expect(hostGraphTools).toHaveLength(1);
+     });
+ 
+-    it('drops graphTools outside the local coding allowlist', () => {
+-      const runner = createMockTool('run_tools_with_code');
+-      const askTool = createMockTool('ask_user_question');
+-      const ctx = createBasicContext({
+-        agentConfig: { graphTools: [runner, askTool] },
+-        toolExecution: {
+-          engine: 'local',
+-          local: { codingToolNames: ['read_file'] },
+-        },
+-      });
+-      expect(
+-        (ctx.graphTools as t.GenericTool[]).map((tool) => tool.name)
+-      ).toEqual(['ask_user_question']);
+-    });
+-
+     it('leaves graphTools undefined when the host supplies none (or an empty list)', () => {
+       expect(createBasicContext().graphTools).toBeUndefined();
+       expect(
+@@ -329,7 +315,7 @@ describe('AgentContext', () => {
+       );
+     });
+ 
+-    it('places the Bedrock cache point before dynamic system text', async () => {
++    it('moves the dynamic Bedrock text out of the system message', async () => {
+       const ctx = createBasicContext({
+         agentConfig: {
+           provider: Providers.BEDROCK,
+@@ -347,8 +333,196 @@ describe('AgentContext', () => {
+       expect(content).toEqual([
+         { type: 'text', text: 'Stable instructions' },
+         { cachePoint: { type: 'default', ttl: '1h' } },
+-        { type: 'text', text: 'Dynamic instructions' },
+       ]);
++      expect(result[1].content).toBe('Dynamic instructions');
++    });
++
++    it('keeps the Bedrock history in front of the moved tail and marks both ends of it', async () => {
++      const build = (dynamic: string): AgentContext =>
++        createBasicContext({
++          agentConfig: {
++            provider: Providers.BEDROCK,
++            clientOptions: {
++              model: 'anthropic.claude-sonnet-4-5-20250929-v1:0',
++              promptCache: true,
++            },
++            instructions: 'Stable instructions',
++            additional_instructions: dynamic,
++          },
++        });
++      const history = (): BaseMessage[] => [
++        new HumanMessage('Q1'),
++        new AIMessage('A1'),
++        new HumanMessage('Q2'),
++        new AIMessage('A2'),
++        new HumanMessage('Q3'),
++      ];
++      const first = await build('Tail one').systemRunnable!.invoke(history());
++      const second = await build('Tail two').systemRunnable!.invoke(history());
++
++      /** system, Q1, A1, Q2, A2, tail, Q3 */
++      expect(first.map((message) => message.content)).toEqual([
++        [
++          { type: 'text', text: 'Stable instructions' },
++          { cachePoint: { type: 'default', ttl: '1h' } },
++        ],
++        'Q1',
++        'A1',
++        'Q2',
++        [
++          { type: 'text', text: 'A2' },
++          { cachePoint: { type: 'default', ttl: '1h' } },
++        ],
++        'Tail one',
++        [
++          { type: 'text', text: 'Q3' },
++          { cachePoint: { type: 'default', ttl: '1h' } },
++        ],
++      ]);
++      expect(JSON.stringify(second.slice(0, 5))).toBe(
++        JSON.stringify(first.slice(0, 5))
++      );
++      expect(second[5].content).toBe('Tail two');
++    });
++
++    it('leaves one Bedrock checkpoint for the tools and never exceeds the limit of four', async () => {
++      const ctx = createBasicContext({
++        agentConfig: {
++          provider: Providers.BEDROCK,
++          clientOptions: {
++            model: 'anthropic.claude-sonnet-4-5-20250929-v1:0',
++            promptCache: true,
++          },
++          instructions: 'Stable instructions',
++          conversation_instructions: 'Conversation context',
++          additional_instructions: 'Dynamic instructions',
++        },
++      });
++      const result = await ctx.systemRunnable!.invoke([
++        new HumanMessage('Q1'),
++        new AIMessage('A1'),
++        new HumanMessage('Q2'),
++        new AIMessage('A2'),
++        new HumanMessage('Q3'),
++      ]);
++      const checkpoints = JSON.stringify(result).match(/"cachePoint"/g) ?? [];
++
++      /** Tools (added when the request is built) + stable + history + request end. */
++      expect(checkpoints).toHaveLength(3);
++      expect(JSON.stringify(result[0].content)).not.toContain(
++        'Conversation context","cachePoint'
++      );
++    });
++
++    it('gives the Bedrock conversation block its checkpoint while there is room', async () => {
++      const ctx = createBasicContext({
++        agentConfig: {
++          provider: Providers.BEDROCK,
++          clientOptions: {
++            model: 'anthropic.claude-sonnet-4-5-20250929-v1:0',
++            promptCache: true,
++          },
++          instructions: 'Stable instructions',
++          conversation_instructions: 'Conversation context',
++          additional_instructions: 'Dynamic instructions',
++        },
++      });
++      const result = await ctx.systemRunnable!.invoke([new HumanMessage('Q1')]);
++      const content = result[0].content as TestSystemContentBlock[];
++
++      expect(content.map((block) => ('text' in block ? block.text : 'cachePoint'))).toEqual([
++        'Stable instructions',
++        'cachePoint',
++        'Conversation context',
++        'cachePoint',
++      ]);
++      expect(result[1].content).toBe('Dynamic instructions');
++    });
++
++    it.each([
++      ['one message checkpoint', 1, true],
++      ['two message checkpoints', 2, false],
++    ])(
++      'keeps the Bedrock request at four checkpoints when the graph placed %s and there is no tail',
++      async (_name, marked, conversationMarked) => {
++        const ctx = createBasicContext({
++          agentConfig: {
++            provider: Providers.BEDROCK,
++            clientOptions: {
++              model: 'anthropic.claude-sonnet-4-5-20250929-v1:0',
++              promptCache: true,
++            },
++            instructions: 'Stable instructions',
++            conversation_instructions: 'Conversation context',
++          },
++        });
++        const cp = { cachePoint: { type: 'default', ttl: '1h' } };
++        const history = [
++          new HumanMessage({
++            content: [{ type: 'text', text: 'Q1' }, ...(marked === 2 ? [cp] : [])] as never,
++          }),
++          new AIMessage('A1'),
++          new HumanMessage({ content: [{ type: 'text', text: 'Q2' }, cp] as never }),
++        ];
++        const result = await ctx.systemRunnable!.invoke(history);
++        const system = result[0].content as TestSystemContentBlock[];
++        const points = JSON.stringify(result).match(/"cachePoint"/g) ?? [];
++
++        expect(system.some((block) => 'text' in block && block.text === 'Conversation context' )).toBe(true);
++        expect(system.filter((block) => 'cachePoint' in block)).toHaveLength(
++          conversationMarked ? 2 : 1
++        );
++        /** Plus the tool list checkpoint added when the request is built. */
++        expect(points.length + 1).toBeLessThanOrEqual(4);
++      }
++    );
++
++    it('never marks the moved Bedrock tail message', async () => {
++      const ctx = createBasicContext({
++        agentConfig: {
++          provider: Providers.BEDROCK,
++          clientOptions: {
++            model: 'anthropic.claude-sonnet-4-5-20250929-v1:0',
++            promptCache: true,
++          },
++          instructions: 'Stable instructions',
++          additional_instructions: 'Dynamic instructions',
++        },
++      });
++      const cp = { cachePoint: { type: 'default', ttl: '1h' } };
++      const result = await ctx.systemRunnable!.invoke([
++        new HumanMessage({ content: [{ type: 'text', text: 'Q1' }, cp] as never }),
++        new AIMessage('A1'),
++        new HumanMessage({ content: [{ type: 'text', text: 'Q2' }, cp] as never }),
++        new AIMessage({
++          content: '',
++          tool_calls: [{ id: 'call_1', name: 'calculator', args: {} }],
++        }),
++        new ToolMessage({ content: '4', tool_call_id: 'call_1' }),
++      ]);
++      const tail = result.find((message) => message.content === 'Dynamic instructions');
++
++      expect(tail).toBeDefined();
++      expect(JSON.stringify(tail)).not.toContain('cachePoint');
++      expect(result.indexOf(tail!)).toBe(result.findIndex((m) => m.getType() === 'human' && JSON.stringify(m.content).includes('Q2')) - 1);
++      /** Tools take one, the system block one: the opening message keeps none. */
++      expect(JSON.stringify(result).match(/"cachePoint"/g)?.length).toBeLessThanOrEqual(3);
++      expect(JSON.stringify(result[1])).not.toContain('cachePoint');
++    });
++
++    it('keeps the Bedrock tail in the system message without prompt caching', async () => {
++      const ctx = createBasicContext({
++        agentConfig: {
++          provider: Providers.BEDROCK,
++          clientOptions: { model: 'anthropic.claude-sonnet-4-5-20250929-v1:0' },
++          instructions: 'Stable instructions',
++          additional_instructions: 'Dynamic instructions',
++        },
++      });
++      const result = await ctx.systemRunnable!.invoke([new HumanMessage('Q1')]);
++
++      expect(result[0].content).toBe('Stable instructions\n\nDynamic instructions');
++      expect(result).toHaveLength(2);
+     });
+ 
+     it('uses plain Bedrock system text when only dynamic system text exists', async () => {
+@@ -424,6 +598,247 @@ describe('AgentContext', () => {
+       ]);
+     });
+ 
++    describe('conversation_instructions', () => {
++      const breakpoint = { type: 'ephemeral', ttl: '1h' };
++      const createConversationContext = (
++        agentConfig: Partial<t.AgentInputs>
++      ): AgentContext =>
++        createBasicContext({
++          agentConfig: {
++            instructions: 'Stable instructions',
++            conversation_instructions: 'Conversation context',
++            ...agentConfig,
++          },
++        });
++      const markerCount = (messages: unknown[]): number =>
++        JSON.stringify(messages).match(/"cache_control"/g)?.length ?? 0;
++      const anthropicOptions = { model: 'claude-sonnet-4-5', promptCache: true };
++
++      it.each([Providers.ANTHROPIC, Providers.OPENROUTER])(
++        'keeps the %s conversation block after the stable block with its own breakpoint',
++        async (provider) => {
++          const ctx = createConversationContext({
++            provider,
++            clientOptions: anthropicOptions,
++          });
++
++          const result = await ctx.systemRunnable!.invoke([
++            new HumanMessage('Hello'),
++          ]);
++
++          expect(result[0].content).toEqual([
++            { type: 'text', text: 'Stable instructions', cache_control: breakpoint },
++            { type: 'text', text: 'Conversation context', cache_control: breakpoint },
++          ]);
++          expect(result[1].content).toBe('Hello');
++        }
++      );
++
++      it.each([Providers.ANTHROPIC, Providers.OPENROUTER])(
++        'moves only %s additional_instructions and keeps the summary out of the system message',
++        async (provider) => {
++          const ctx = createConversationContext({
++            provider,
++            clientOptions: anthropicOptions,
++            additional_instructions: 'Per-turn context',
++          });
++          ctx.setInitialSummary('Prior summary', 13);
++
++          const result = await ctx.systemRunnable!.invoke([
++            new HumanMessage('First'),
++            new AIMessage('First answer'),
++            new HumanMessage('Second'),
++          ]);
++
++          expect(result[0].content).toEqual([
++            { type: 'text', text: 'Stable instructions', cache_control: breakpoint },
++            { type: 'text', text: 'Conversation context' },
++          ]);
++          expect(result.slice(1).map((message) => message.text)).toEqual([
++            buildSummaryCarrierText('Prior summary'),
++            'First',
++            'First answer',
++            'Per-turn context',
++            'Second',
++          ]);
++          expect(markerCount(result)).toBe(4 - 1);
++        }
++      );
++
++      it.each([Providers.ANTHROPIC, Providers.OPENROUTER])(
++        'gives the %s summary its own breakpoint while one is left',
++        async (provider) => {
++          const ctx = createConversationContext({
++            provider,
++            clientOptions: anthropicOptions,
++          });
++          ctx.setSummary('Checkpoint', 13);
++
++          const result = await ctx.systemRunnable!.invoke([]);
++
++          expect(result[0].content).toEqual([
++            { type: 'text', text: 'Stable instructions', cache_control: breakpoint },
++            { type: 'text', text: 'Conversation context', cache_control: breakpoint },
++          ]);
++          expect(result[1].content).toEqual([
++            {
++              type: 'text',
++              text: buildSummaryCarrierText('Checkpoint'),
++              cache_control: breakpoint,
++            },
++          ]);
++          expect(markerCount(result)).toBe(3);
++        }
++      );
++
++      it('places a Bedrock cache point after the stable and the conversation block', async () => {
++        const ctx = createConversationContext({
++          provider: Providers.BEDROCK,
++          clientOptions: {
++            model: 'anthropic.claude-sonnet-4-5-20250929-v1:0',
++            promptCache: true,
++          },
++          additional_instructions: 'Per-turn context',
++        });
++
++        const result = await ctx.systemRunnable!.invoke([]);
++        const content = result[0].content as TestSystemContentBlock[];
++
++        expect(content.map((block) => ('text' in block ? block.text : 'cachePoint'))).toEqual([
++          'Stable instructions',
++          'cachePoint',
++          'Conversation context',
++          'cachePoint',
++        ]);
++        expect(result[1].content).toBe('Per-turn context');
++      });
++
++      it('joins the blocks in order and sends the summary as the first message', async () => {
++        const ctx = createConversationContext({
++          additional_instructions: 'Per-turn context',
++        });
++        ctx.setInitialSummary('Prior summary', 13);
++
++        const result = await ctx.systemRunnable!.invoke([
++          new HumanMessage('Latest'),
++        ]);
++
++        expect(result[0].content).toBe(
++          'Stable instructions\n\nConversation context\n\nPer-turn context'
++        );
++        expect(result.slice(1).map((message) => message.content)).toEqual([
++          buildSummaryCarrierText('Prior summary'),
++          'Latest',
++        ]);
++      });
++
++      it('counts the conversation block as system tokens, not as a moved tail', () => {
++        const ctx = createBasicContext({
++          agentConfig: {
++            provider: Providers.ANTHROPIC,
++            clientOptions: anthropicOptions,
++            instructions: 'Stable instructions',
++            conversation_instructions: 'Conversation context',
++          },
++          tokenCounter: (message) => JSON.stringify(message.content).length,
++        });
++        ctx.initializeSystemRunnable();
++
++        expect(ctx.dynamicInstructionTokens).toBe(0);
++        expect(ctx.instructionTokens).toBe(ctx.systemMessageTokens);
++      });
++
++      it('counts the summary message as instruction overhead for both summary kinds', () => {
++        const tokenCounter = (message: { content: unknown }): number =>
++          JSON.stringify(message.content).length;
++        const build = (): AgentContext =>
++          createBasicContext({
++            agentConfig: {
++              instructions: 'Stable instructions',
++              conversation_instructions: 'Conversation context',
++            },
++            tokenCounter,
++          });
++        const live = build();
++        const restored = build();
++        void live.systemRunnable;
++        void restored.systemRunnable;
++        const base = live.instructionTokens;
++
++        live.setSummary('Checkpoint', 50);
++        restored.setInitialSummary('Checkpoint', 50);
++
++        expect(live.instructionTokens).toBe(base + 50);
++        expect(restored.instructionTokens).toBe(base + 50);
++      });
++
++      /** A summary is created in one run and restored from `initialSummary` in
++       *  the next; both must render the same request or the next run loses the
++       *  prompt cache of the requests made after the compaction. */
++      it.each([
++        ['openAI', Providers.OPENAI, {}],
++        ['anthropic promptCache', Providers.ANTHROPIC, { promptCache: true }],
++        ['openrouter promptCache', Providers.OPENROUTER, { promptCache: true }],
++        ['bedrock promptCache', Providers.BEDROCK, { promptCache: true }],
++      ])(
++        'renders a summary from this run like the same summary restored next run (%s)',
++        async (_name, provider, cacheOptions) => {
++          const build = (): AgentContext =>
++            createConversationContext({
++              provider,
++              clientOptions: { model: 'claude-sonnet-4-5', ...cacheOptions },
++              additional_instructions: 'Per-turn context',
++            });
++          const live = build();
++          live.setSummary('Checkpoint', 10);
++          const restored = build();
++          restored.setInitialSummary('Checkpoint', 10);
++
++          for (const messages of [
++            [],
++            [new HumanMessage('Task')],
++            [
++              new AIMessage({
++                content: '',
++                tool_calls: [{ id: 'call_1', name: 'calculator', args: {} }],
++              }),
++              new ToolMessage({ content: '4', tool_call_id: 'call_1' }),
++            ],
++          ]) {
++            const [fromRun, fromRestore] = await Promise.all([
++              live.systemRunnable!.invoke(messages),
++              restored.systemRunnable!.invoke(messages),
++            ]);
++            expect(fromRun).toEqual(fromRestore);
++            expect(JSON.stringify(fromRun[1].content)).toContain('Checkpoint');
++          }
++        }
++      );
++
++      it('keeps the earlier placement for a host that passes no conversation_instructions', async () => {
++        const ctx = createBasicContext({
++          agentConfig: { instructions: 'Stable instructions' },
++        });
++        ctx.setInitialSummary('Prior summary', 13);
++
++        const [restored] = await ctx.systemRunnable!.invoke([]);
++        expect(restored.content).toBe(
++          'Stable instructions\n\n## Conversation Summary\n\nPrior summary'
++        );
++        expect(ctx.instructionTokens).toBe(ctx.systemMessageTokens);
++
++        ctx.setSummary('Checkpoint', 7);
++        const result = await ctx.systemRunnable!.invoke([
++          new HumanMessage('Latest'),
++        ]);
++        expect(result[0].content).toBe('Stable instructions');
++        expect(result.slice(1).map((message) => message.content)).toEqual([
++          buildSummaryCarrierText('Checkpoint'),
++          'Latest',
++        ]);
++      });
++    });
++
+     it('keeps dynamic-only OpenRouter instructions as system text', async () => {
+       const tokenCounter = (msg: { content: unknown }): number => {
+         const content =
+@@ -1030,7 +1445,6 @@ describe('AgentContext', () => {
+       expect(finalMessages[0].content).toEqual([
+         { type: 'text', text: 'Stable instructions' },
+         { cachePoint: { type: 'default', ttl: '1h' } },
+-        { type: 'text', text: 'Dynamic instructions' },
+       ]);
+     });
+   });
+@@ -1809,51 +2223,6 @@ describe('AgentContext', () => {
+       expect(ctx.instructionTokens).toBeGreaterThan(initialTokens);
+     });
+ 
+-    it('ignores a cached toolSchemaTokens total once the local allowlist removes tools', async () => {
+-      const defs: t.LCTool[] = ['read_file', 'bash_tool'].map((name) => ({
+-        name,
+-        description: name,
+-        parameters: { type: 'object', properties: {} },
+-      }));
+-      const toolExecution: t.ToolExecutionConfig = {
+-        engine: 'local',
+-        local: { codingToolNames: ['read_file'] },
+-      };
+-      const filtered = createBasicContext({
+-        agentConfig: { toolDefinitions: defs, toolSchemaTokens: 99999 },
+-        tokenCounter: mockTokenCounter,
+-        toolExecution,
+-      });
+-      const unfiltered = createBasicContext({
+-        agentConfig: { toolDefinitions: defs, toolSchemaTokens: 99999 },
+-        tokenCounter: mockTokenCounter,
+-      });
+-      await filtered.tokenCalculationPromise;
+-      await unfiltered.tokenCalculationPromise;
+-      expect(filtered.toolSchemaTokens).not.toBe(99999);
+-      expect(unfiltered.toolSchemaTokens).toBe(99999);
+-    });
+-
+-    it('keeps the cached total when a retained tool is a native schema the recount cannot measure', async () => {
+-      const nativeSearch = {
+-        type: 'function',
+-        function: { name: 'web_search', parameters: {} },
+-      } as unknown as t.GenericTool;
+-      const ctx = createBasicContext({
+-        agentConfig: {
+-          tools: [createMockTool('bash_tool'), nativeSearch],
+-          toolSchemaTokens: 99999,
+-        },
+-        tokenCounter: mockTokenCounter,
+-        toolExecution: {
+-          engine: 'local',
+-          local: { codingToolNames: ['read_file'] },
+-        },
+-      });
+-      await ctx.tokenCalculationPromise;
+-      expect(ctx.toolSchemaTokens).toBe(99999);
+-    });
+-
+     it('excludes deferred-undiscovered toolDefinitions from toolSchemaTokens', async () => {
+       const activeDef: t.LCTool = {
+         name: 'active_tool',
+@@ -3255,55 +3624,4 @@ describe('AgentContext', () => {
+       expect(ctx.systemMessageTokens).toBeGreaterThan(systemBefore);
+     });
+   });
+-
+-  describe('toolDispatch', () => {
+-    const boundNames = (ctx: AgentContext): string[] =>
+-      (ctx.getToolsForBinding() ?? []).map((tool) =>
+-        'name' in tool ? String(tool.name) : ''
+-      );
+-    const toolDefinitions: t.LCTool[] = [
+-      { name: 'bound_tool' },
+-      { name: 'late_tool', defer_loading: true },
+-    ];
+-
+-    it('binds call_tool after the other tools and leaves deferred tools unbound', () => {
+-      const ctx = createBasicContext({
+-        agentConfig: { toolDefinitions, toolDispatch: true },
+-      });
+-      expect(boundNames(ctx)).toEqual(['bound_tool', 'call_tool']);
+-    });
+-
+-    it('keeps a discovered deferred tool unbound with the dispatcher, bound without it', () => {
+-      const bound = (toolDispatch: boolean): string[] => {
+-        const ctx = createBasicContext({
+-          agentConfig: { toolDefinitions, toolDispatch: toolDispatch || undefined },
+-        });
+-        ctx.markToolsAsDiscovered(['late_tool']);
+-        return boundNames(ctx);
+-      };
+-      expect(bound(true)).toEqual(['bound_tool', 'call_tool']);
+-      expect(bound(false)).toEqual(['bound_tool', 'late_tool']);
+-    });
+-
+-    it('binds no dispatcher unless the host opts in', () => {
+-      const ctx = createBasicContext({ agentConfig: { toolDefinitions } });
+-      expect(boundNames(ctx)).toEqual(['bound_tool']);
+-    });
+-
+-    it('counts the dispatcher schema with the other tool schemas', async () => {
+-      const tokenCounter = (message: { content: unknown }): number =>
+-        String(message.content).includes('call_tool') ? 100 : 1;
+-      const toolTokens = async (toolDispatch?: boolean): Promise<number> => {
+-        const ctx = createBasicContext({
+-          agentConfig: { toolDefinitions, toolDispatch },
+-        });
+-        await ctx.calculateInstructionTokens(
+-          tokenCounter as unknown as t.TokenCounter
+-        );
+-        return ctx.toolSchemaTokens;
+-      };
+-
+-      expect((await toolTokens(true)) - (await toolTokens())).toBeGreaterThanOrEqual(100);
+-    });
+-  });
+ });
+diff --git a/src/specs/prompt-cache/prompt-cache.test.ts b/src/specs/prompt-cache/prompt-cache.test.ts
+new file mode 100644
+index 00000000..70d5678b
+--- /dev/null
++++ b/src/specs/prompt-cache/prompt-cache.test.ts
+@@ -0,0 +1,181 @@
++import type { CapturedTurn, Json } from './harness';
++import {
++  endOfText,
++  endOfTools,
++  countMatches,
++  toolSegments,
++  runConversation,
++  stripCacheMarkers,
++  commonPrefixLength,
++  serializeInCacheOrder,
++} from './harness';
++import { PROVIDER_CASES } from './providers';
++import { SCENARIOS } from './scenarios';
++
++jest.setTimeout(120_000);
++
++const isResetTurn = ({ reset }: CapturedTurn): boolean => reset;
++
++const marker = (value: Json): string =>
++  JSON.stringify(stripCacheMarkers(value));
++
++const escaped = (text: string): string => JSON.stringify(text).slice(1, -1);
++
++/** System prompt without this turn's volatile part, which may differ per turn. */
++const fixedSystem = ({ request, turn }: CapturedTurn): string => {
++  const system = marker(request.system);
++  return turn.additionalInstructions == null
++    ? system
++    : system.replace(escaped(turn.additionalInstructions), '');
++};
++
++/** Start of the segment that carries the volatile part, or the full length. */
++const reusableLength = (serialized: string, { turn }: CapturedTurn): number => {
++  if (turn.additionalInstructions == null) {
++    return serialized.length;
++  }
++  const start = serialized.indexOf(escaped(turn.additionalInstructions));
++  return start < 0 ? serialized.length : serialized.lastIndexOf('\n', start) + 1;
++};
++
++function roleOf(message: Json): string | undefined {
++  if (message == null || typeof message !== 'object' || Array.isArray(message)) {
++    return undefined;
++  }
++  const role = message.role;
++  return typeof role === 'string' ? role : undefined;
++}
++
++describe.each(PROVIDER_CASES.map((providerCase) => [providerCase.name, providerCase]))(
++  'prompt cache: %s',
++  (_name, providerCase) => {
++    describe.each(SCENARIOS.map((scenario) => [scenario.name, scenario]))(
++      '%s',
++      (_scenarioName, scenario) => {
++        let conversations: CapturedTurn[][];
++
++        beforeAll(async () => {
++          conversations = [];
++          for (const conversation of scenario.conversations) {
++            conversations.push(
++              await runConversation(providerCase, scenario, conversation)
++            );
++          }
++        });
++
++        const allTurns = (): CapturedTurn[] => conversations.flat();
++
++        const consecutiveTurns = (
++          select: (next: CapturedTurn) => boolean
++        ): Array<[CapturedTurn, CapturedTurn]> =>
++          conversations.flatMap((turns) =>
++            turns
++              .slice(1)
++              .map((next, i): [CapturedTurn, CapturedTurn] => [turns[i], next])
++              .filter(([, next]) => select(next))
++          );
++
++        it('keeps the conversation block in the system prompt', () => {
++          for (const captured of allTurns()) {
++            const system = JSON.stringify(captured.request.system);
++            expect(system).toContain(escaped(captured.conversationInstructions));
++            expect(system).toContain(escaped(captured.instructions));
++          }
++        });
++
++        it('moves only the per-turn volatile part, and only where documented', () => {
++          for (const { request, turn } of allTurns()) {
++            if (turn.additionalInstructions == null) {
++              continue;
++            }
++            const volatile = escaped(turn.additionalInstructions);
++            const inSystem = JSON.stringify(request.system).includes(volatile);
++            expect(inSystem).toBe(providerCase.movesDynamicPart !== true);
++            expect(JSON.stringify(request.messages).includes(volatile)).toBe(
++              !inSystem
++            );
++          }
++        });
++
++        it('keeps tools and system fixed between reset points', () => {
++          for (const [previous, next] of consecutiveTurns(
++            (turn) => !isResetTurn(turn)
++          )) {
++            expect(toolSegments(next.request).map(marker)).toEqual(
++              toolSegments(previous.request).map(marker)
++            );
++            expect(fixedSystem(next)).toBe(fixedSystem(previous));
++          }
++        });
++
++        it('starts every request with the previous one up to its volatile part', () => {
++          for (const [previous, next] of consecutiveTurns(
++            (turn) => !isResetTurn(turn)
++          )) {
++            const before = serializeInCacheOrder(previous.request);
++            const after = serializeInCacheOrder(next.request);
++            const required = next.followUp
++              ? before.length
++              : reusableLength(before, previous);
++            expect(commonPrefixLength(before, after)).toBeGreaterThanOrEqual(
++              required
++            );
++          }
++        });
++
++        it('keeps the cached prefix up to the declared boundary at reset points', () => {
++          for (const [previous, next] of consecutiveTurns(isResetTurn)) {
++            const before = serializeInCacheOrder(previous.request);
++            const after = serializeInCacheOrder(next.request);
++            const appendsTools =
++              (next.turn.compaction?.appendTools?.length ?? 0) > 0;
++            const boundary = appendsTools
++              ? endOfTools(previous.request)
++              : endOfText(before, previous.instructions);
++            expect(boundary).toBeGreaterThan(0);
++            expect(commonPrefixLength(before, after)).toBeGreaterThanOrEqual(
++              boundary
++            );
++            if (next.turn.compaction != null) {
++              expect(after).toContain(escaped(next.turn.compaction.summary));
++            }
++          }
++        });
++
++        if (scenario.conversations.length > 1) {
++          it('shares tools and stable instructions across conversations', () => {
++            const [first, second] = conversations.map((turns) =>
++              serializeInCacheOrder(turns[0].request)
++            );
++            expect(commonPrefixLength(first, second)).toBeGreaterThanOrEqual(
++              endOfText(first, scenario.instructions)
++            );
++          });
++        }
++
++        if (providerCase.breakpoints != null) {
++          const { pattern, max } = providerCase.breakpoints;
++          it(`uses at most ${max} cache breakpoints per request`, () => {
++            for (const { request } of allTurns()) {
++              const count = countMatches(request.raw, pattern);
++              expect(count).toBeGreaterThan(0);
++              expect(count).toBeLessThanOrEqual(max);
++            }
++          });
++        }
++
++        if (providerCase.strictAlternation === true) {
++          it('never sends two user messages in a row', () => {
++            for (const { request } of allTurns()) {
++              const roles = request.messages.map(roleOf);
++              for (let i = 1; i < roles.length; i++) {
++                const pair = `${roles[i - 1]}>${roles[i]}`;
++                expect(['user>user', 'human>human']).not.toContain(pair);
++              }
++            }
++          });
++        }
++      }
++    );
++  }
++);
+diff --git a/src/specs/prompt-cache/tool-dispatch.test.ts b/src/specs/prompt-cache/tool-dispatch.test.ts
+new file mode 100644
+index 00000000..6285ea97
+--- /dev/null
++++ b/src/specs/prompt-cache/tool-dispatch.test.ts
+@@ -0,0 +1,311 @@
++import { AIMessage, HumanMessage } from '@langchain/core/messages';
++import type { BaseMessage } from '@langchain/core/messages';
++import type { CapturedRequest, Json, ToolSpec } from './harness';
++import type { FakeToolCall, ProviderCase } from './providers';
++import type * as t from '@/types';
++import {
++  toolSegments,
++  stripCacheMarkers,
++  commonPrefixLength,
++  serializeInCacheOrder,
++} from './harness';
++import { TOOL_DISPATCHER_NAME } from '@/tools/toolDispatch';
++import { createToolSearch } from '@/tools/ToolSearch';
++import { formatAgentMessages } from '@/messages/format';
++import { createContentAggregator } from '@/stream';
++import { PROVIDER_CASES } from './providers';
++import { Constants, GraphEvents } from '@/common';
++import { Run } from '@/run';
++
++/**
++ * A tool made available mid-conversation through the dispatcher: the host
++ * registers it as deferred and announces it, and the model reaches it through
++ * `call_tool`. Model replies are faked in each provider's own streaming
++ * format; the SDK runs the target, and the result lands in the next request
++ * while `tools` never changes.
++ */
++
++jest.setTimeout(120_000);
++
++const INSTRUCTIONS = 'You are a careful support assistant.';
++const TOOLS: ToolSpec[] = [
++  { name: 'lookup_order', description: 'Looks up an order by its identifier.' },
++  { name: 'search_docs', description: 'Searches the product documentation.' },
++];
++const QUERY_SCHEMA: t.JsonSchemaType = {
++  type: 'object',
++  properties: { query: { type: 'string', description: 'Query' } },
++  required: ['query'],
++};
++const TARGET: t.LCTool = {
++  name: 'search_wiki',
++  description: 'Searches the internal wiki.',
++  parameters: QUERY_SCHEMA,
++  defer_loading: true,
++};
++const ANNOUNCEMENT = `Tool \`${TARGET.name}\` is now available. Call it with \`${TOOL_DISPATCHER_NAME}\`.\n- ${TARGET.name}: ${TARGET.description}\n  parameters: ${JSON.stringify(QUERY_SCHEMA)}`;
++const TARGET_ARGS = { query: 'bolts' };
++const DISPATCHER_CALL: FakeToolCall = {
++  id: 'call_dispatch_1',
++  name: TOOL_DISPATCHER_NAME,
++  args: { name: TARGET.name, arguments: JSON.stringify(TARGET_ARGS) },
++};
++const RESULT = 'wiki: bolts are in aisle 7';
++const QUESTION = 'Where are the bolts?';
++
++const REPLIES: FakeToolCall[] = [DISPATCHER_CALL];
++
++const DECLARED_TOOLS = [
++  ...TOOLS.map(({ name }) => name),
++  Constants.TOOL_SEARCH,
++  TOOL_DISPATCHER_NAME,
++];
++
++type Captured = {
++  requests: CapturedRequest[];
++  executed: Array<{ name: string; args: unknown }>;
++  /** Content parts of the dispatching turn, as a host stores them. */
++  stored: t.MessageContentComplex[];
++};
++
++function definitionOf({ name, description }: ToolSpec): t.LCTool {
++  return { name, description, parameters: QUERY_SCHEMA };
++}
++
++function createAgent(
++  providerCase: ProviderCase,
++  targetAvailable: boolean
++): t.AgentInputs {
++  const definitions = [
++    ...TOOLS.map(definitionOf),
++    ...(targetAvailable ? [TARGET] : []),
++  ];
++  /** No registry at creation: its listing would change the tool description. */
++  const toolSearch = createToolSearch({ mode: 'local' }) as t.GenericTool;
++  return {
++    agentId: 'prompt-cache-agent',
++    provider: providerCase.provider,
++    clientOptions: providerCase.clientOptions(),
++    instructions: INSTRUCTIONS,
++    maxContextTokens: 100_000,
++    toolDispatch: true,
++    toolRegistry: new Map(definitions.map((def) => [def.name, def])),
++    toolDefinitions: definitions,
++    graphTools: [toolSearch],
++  } as t.AgentInputs;
++}
++
++function hostToolHandler(captured: Captured): t.EventHandler {
++  return {
++    handle: (_event: string, data: unknown): void => {
++      const batch = data as t.ToolExecuteBatchRequest;
++      batch.resolve(
++        batch.toolCalls.map((call) => {
++          captured.executed.push({ name: call.name, args: call.args });
++          return { toolCallId: call.id, content: RESULT, status: 'success' };
++        })
++      );
++    },
++  };
++}
++
++function aggregatingHandlers(
++  aggregate: t.ContentAggregator
++): Record<string, t.EventHandler> {
++  const forward = (event: string, data: unknown): void =>
++    aggregate({ event, data } as Parameters<t.ContentAggregator>[0]);
++  return Object.fromEntries(
++    [
++      GraphEvents.ON_RUN_STEP,
++      GraphEvents.ON_RUN_STEP_DELTA,
++      GraphEvents.ON_RUN_STEP_COMPLETED,
++      GraphEvents.ON_MESSAGE_DELTA,
++    ].map((event) => [event, { handle: forward }])
++  );
++}
++
++/**
++ * Runs one turn; `replies` answer the turn's first model requests with tool
++ * calls, and the request after the last tool round is captured too. Returns
++ * the turn's content parts as a host aggregates them.
++ */
++async function runTurn(
++  providerCase: ProviderCase,
++  agent: t.AgentInputs,
++  captured: Captured,
++  messages: BaseMessage[],
++  replies: FakeToolCall[] = []
++): Promise<t.MessageContentComplex[]> {
++  const { contentParts, aggregateContent } = createContentAggregator();
++  const pendingReplies = [...replies];
++  const restore = providerCase.intercept(agent, (body: Json) => {
++    captured.requests.push(providerCase.reduce(body));
++    return pendingReplies.shift();
++  });
++  try {
++    const runId = `tool-dispatch-${providerCase.name}-${Math.random()}`;
++    const run = await Run.create<t.IState>({
++      runId,
++      graphConfig: { type: 'standard', agents: [agent] },
++      returnContent: true,
++      skipCleanup: true,
++      customHandlers: {
++        ...aggregatingHandlers(aggregateContent),
++        [GraphEvents.ON_TOOL_EXECUTE]: hostToolHandler(captured),
++      },
++    });
++    await run
++      .processStream(
++        { messages },
++        { configurable: { thread_id: runId }, version: 'v2' }
++      )
++      .catch(() => undefined);
++    return contentParts.filter(
++      (part): part is t.MessageContentComplex => part != null
++    );
++  } finally {
++    restore();
++  }
++}
++
++async function runConversation(
++  providerCase: ProviderCase
++): Promise<Captured> {
++  const captured: Captured = { requests: [], executed: [], stored: [] };
++  const history: BaseMessage[] = [new HumanMessage('Hello.')];
++  await runTurn(
++    providerCase,
++    createAgent(providerCase, false),
++    captured,
++    history
++  );
++  history.push(
++    new AIMessage('Hi.'),
++    new HumanMessage(`${ANNOUNCEMENT}\n\n${QUESTION}`)
++  );
++  captured.stored = await runTurn(
++    providerCase,
++    createAgent(providerCase, true),
++    captured,
++    history,
++    REPLIES
++  );
++  /** The next turn's history is rebuilt from stored parts, as hosts do. */
++  const { messages: restored } = formatAgentMessages(
++    [
++      {
++        role: 'assistant',
++        content: [...captured.stored, { type: 'text', text: 'In aisle 7.' }],
++      },
++    ],
++    undefined,
++    new Set(DECLARED_TOOLS)
++  );
++  history.push(...restored, new HumanMessage('Thanks.'));
++  await runTurn(
++    providerCase,
++    createAgent(providerCase, true),
++    captured,
++    history
++  );
++  return captured;
++}
++
++const marker = (value: Json): string =>
++  JSON.stringify(stripCacheMarkers(value));
++
++function declaredToolName(segment: Json): string | undefined {
++  if (segment == null || typeof segment !== 'object' || Array.isArray(segment)) {
++    return undefined;
++  }
++  for (const holder of [segment, segment.function, segment.toolSpec]) {
++    if (
++      holder != null &&
++      typeof holder === 'object' &&
++      !Array.isArray(holder) &&
++      typeof holder.name === 'string'
++    ) {
++      return holder.name;
++    }
++  }
++  return undefined;
++}
++
++const CALL_FIELDS = ['arguments', 'input', 'args', 'response'];
++const ARGUMENT_FIELDS = new Set(['input', 'args', 'arguments', 'response']);
++
++/** Names of tool calls and results in every provider's message format. */
++function calledToolNames(value: Json, names: string[] = []): string[] {
++  if (Array.isArray(value)) {
++    value.forEach((item) => calledToolNames(item, names));
++    return names;
++  }
++  if (value == null || typeof value !== 'object') {
++    return names;
++  }
++  if (
++    typeof value.name === 'string' &&
++    CALL_FIELDS.some((field) => field in value)
++  ) {
++    names.push(value.name);
++  }
++  for (const [key, nested] of Object.entries(value)) {
++    if (!ARGUMENT_FIELDS.has(key)) {
++      calledToolNames(nested, names);
++    }
++  }
++  return names;
++}
++
++describe.each(PROVIDER_CASES.map((providerCase) => [providerCase.name, providerCase]))(
++  'tool dispatch: %s',
++  (_name, providerCase) => {
++    let captured: Captured;
++    /** The request after the dispatched tool round. */
++    const afterDispatch = REPLIES.length + 1;
++
++    beforeAll(async () => {
++      captured = await runConversation(providerCase);
++    });
++
++    it('keeps tools byte-identical, with the dispatcher and without the target', () => {
++      expect(captured.requests).toHaveLength(REPLIES.length + 3);
++      const [first, ...rest] = captured.requests.map((request) =>
++        toolSegments(request).map(marker)
++      );
++      for (const tools of rest) {
++        expect(tools).toEqual(first);
++      }
++      const names = toolSegments(captured.requests[0]).map(declaredToolName);
++      expect(names).toEqual(DECLARED_TOOLS);
++    });
++
++    it('starts every request with the previous one', () => {
++      /** Responses restores a tool round as the provider's items, which is not part of this change. */
++      const count =
++        providerCase.name === 'openAI responses'
++          ? captured.requests.length - 1
++          : captured.requests.length;
++      for (let i = 1; i < count; i++) {
++        const before = serializeInCacheOrder(captured.requests[i - 1]);
++        const after = serializeInCacheOrder(captured.requests[i]);
++        expect(commonPrefixLength(before, after)).toBeGreaterThanOrEqual(
++          before.length
++        );
++      }
++    });
++
++    it('answers the dispatcher call and names only declared tools in the history', () => {
++      expect(captured.executed).toEqual([{ name: TARGET.name, args: TARGET_ARGS }]);
++      for (const request of captured.requests.slice(afterDispatch)) {
++        expect(JSON.stringify(request.messages)).toContain(RESULT);
++      }
++      for (const request of captured.requests) {
++        const declared = new Set(toolSegments(request).map(declaredToolName));
++        for (const name of calledToolNames(request.messages)) {
++          expect(declared).toContain(name);
++        }
++      }
++    });
++  }
++);
+diff --git a/src/tools/__tests__/toolDispatch.test.ts b/src/tools/__tests__/toolDispatch.test.ts
+new file mode 100644
+index 00000000..822ab555
+--- /dev/null
++++ b/src/tools/__tests__/toolDispatch.test.ts
+@@ -0,0 +1,971 @@
++import { z } from 'zod';
++import { tool } from '@langchain/core/tools';
++import { AIMessage } from '@langchain/core/messages';
++import { describe, it, expect, jest, afterEach } from '@jest/globals';
++import {
++  END,
++  START,
++  Command,
++  StateGraph,
++  MemorySaver,
++  isInterrupted,
++  MessagesAnnotation,
++} from '@langchain/langgraph';
++import type { BaseMessage, ToolMessage } from '@langchain/core/messages';
++import type { StructuredToolInterface } from '@langchain/core/tools';
++import type { RunnableConfig } from '@langchain/core/runnables';
++import type { PreToolUseHookInput, PreToolUseHookOutput } from '@/hooks';
++import type * as t from '@/types';
++import {
++  TOOL_DISPATCHER_NAME,
++  resolveDispatchedToolCall,
++  rewriteDispatchedToolCalls,
++  createToolDispatcherDefinition,
++} from '../toolDispatch';
++import { createToolSearch } from '../ToolSearch';
++import {
++  TOOL_BATCH_REPLAY_KEY,
++  getToolBatchReplayState,
++} from '../toolBatchReplay';
++import { HookRegistry, createToolPolicyHook } from '@/hooks';
++import { AgentContext } from '@/agents/AgentContext';
++import { GraphEvents, Providers } from '@/common';
++import * as events from '@/utils/events';
++import { ToolNode } from '../ToolNode';
++
++const DISPATCH = { name: TOOL_DISPATCHER_NAME };
++
++const QUERY_SCHEMA: t.JsonSchemaType = {
++  type: 'object',
++  properties: {
++    query: { type: 'string' },
++    limit: { type: 'integer' },
++  },
++  required: ['query'],
++};
++
++const DEFINITIONS: t.LCTool[] = [
++  {
++    name: 'lookup_order',
++    description: 'Bound tool.',
++    parameters: QUERY_SCHEMA,
++  },
++  {
++    name: 'search_wiki',
++    description: 'Made available mid-conversation.',
++    parameters: QUERY_SCHEMA,
++    defer_loading: true,
++  },
++  {
++    name: 'run_script',
++    description: 'Code execution only.',
++    parameters: QUERY_SCHEMA,
++    defer_loading: true,
++    allowed_callers: ['code_execution'],
++  },
++  {
++    name: 'old_search',
++    description: 'Switched off by the user.',
++    parameters: QUERY_SCHEMA,
++    disabled: { reason: 'the user turned it off' },
++  },
++];
++
++const registry = new Map(DEFINITIONS.map((def) => [def.name, def]));
++
++function dispatcherCall(
++  name: unknown,
++  args?: unknown,
++  id = 'call_d'
++): { id: string; name: string; args: Record<string, unknown> } {
++  return {
++    id,
++    name: TOOL_DISPATCHER_NAME,
++    args: { name, ...(args !== undefined && { arguments: args }) },
++  };
++}
++
++function errorOf(
++  resolution: ReturnType<typeof resolveDispatchedToolCall>
++): string {
++  if (!('error' in resolution)) {
++    throw new Error('expected a refusal');
++  }
++  return resolution.error;
++}
++
++describe('resolveDispatchedToolCall', () => {
++  it('unwraps a dispatcher call to its target under the same id', () => {
++    const resolution = resolveDispatchedToolCall(
++      dispatcherCall('search_wiki', '{"query":"bolts","limit":"3"}'),
++      registry,
++      DISPATCH
++    );
++    expect(resolution).toEqual({
++      call: {
++        id: 'call_d',
++        name: 'search_wiki',
++        args: { query: 'bolts', limit: 3 },
++      },
++      dispatcher: TOOL_DISPATCHER_NAME,
++    });
++  });
++
++  it('accepts arguments given as an object', () => {
++    const resolution = resolveDispatchedToolCall(
++      dispatcherCall('search_wiki', { query: 'nuts' }),
++      registry,
++      DISPATCH
++    );
++    expect('call' in resolution && resolution.call.args).toEqual({
++      query: 'nuts',
++    });
++  });
++
++  it('passes ordinary calls through untouched', () => {
++    const call = { id: 'c', name: 'lookup_order', args: { query: '42' } };
++    expect(resolveDispatchedToolCall(call, registry, DISPATCH)).toEqual({
++      call,
++    });
++    expect(resolveDispatchedToolCall(call, registry)).toEqual({ call });
++  });
++
++  it('does not unwrap when the host did not enable the dispatcher', () => {
++    const call = dispatcherCall('search_wiki', '{"query":"x"}');
++    expect(resolveDispatchedToolCall(call, registry)).toEqual({ call });
++    const direct = { id: 'c', name: 'search_wiki', args: { query: 'x' } };
++    expect(resolveDispatchedToolCall(direct, registry)).toEqual({
++      call: direct,
++    });
++  });
++
++  it('runs a direct call to a dispatchable tool as a dispatched call', () => {
++    expect(
++      resolveDispatchedToolCall(
++        { id: 'c', name: 'search_wiki', args: { query: 'x', limit: '2' } },
++        registry,
++        DISPATCH
++      )
++    ).toEqual({
++      call: { id: 'c', name: 'search_wiki', args: { query: 'x', limit: 2 } },
++      dispatcher: TOOL_DISPATCHER_NAME,
++      rewrite: {
++        name: TOOL_DISPATCHER_NAME,
++        args: { name: 'search_wiki', arguments: '{"query":"x","limit":2}' },
++      },
++    });
++    expect(
++      errorOf(
++        resolveDispatchedToolCall(
++          { id: 'c', name: 'search_wiki', args: {} },
++          registry,
++          DISPATCH
++        )
++      )
++    ).toContain('Invalid arguments for "search_wiki"');
++  });
++
++  it('rewrites every provider-native copy of a rewritten call', () => {
++    const rewrite = {
++      name: TOOL_DISPATCHER_NAME,
++      args: { name: 'search_wiki', arguments: '{"query":"x"}' },
++    };
++    const rewritten = rewriteDispatchedToolCalls(
++      new AIMessage({
++        id: 'msg_1',
++        content: [
++          {
++            type: 'tool_use',
++            id: 'c',
++            name: 'search_wiki',
++            input: { query: 'x' },
++          },
++        ],
++        additional_kwargs: {
++          tool_calls: [
++            {
++              id: 'c',
++              type: 'function',
++              function: { name: 'search_wiki', arguments: '{"query":"x"}' },
++            },
++          ],
++        },
++        response_metadata: {
++          output: [
++            {
++              type: 'function_call',
++              id: 'fc_1',
++              call_id: 'c',
++              name: 'search_wiki',
++              arguments: '{"query":"x"}',
++            },
++          ],
++        },
++        tool_calls: [{ id: 'c', name: 'search_wiki', args: { query: 'x' } }],
++      }),
++      new Map([['c', rewrite]])
++    );
++    const serialized = JSON.stringify([
++      rewritten.content,
++      rewritten.additional_kwargs,
++      rewritten.response_metadata,
++      rewritten.tool_calls,
++    ]);
++    expect(serialized.match(/"name":"call_tool"/g)).toHaveLength(4);
++    expect(rewritten.id).toBe('msg_1');
++    expect(rewritten.tool_calls).toEqual([
++      expect.objectContaining({ id: 'c', ...rewrite }),
++    ]);
++    expect(rewritten.content).toEqual([
++      {
++        type: 'tool_use',
++        id: 'c',
++        name: TOOL_DISPATCHER_NAME,
++        input: rewrite.args,
++      },
++    ]);
++  });
++
++  it('refuses unknown targets, bound tools, and code-execution-only tools', () => {
++    expect(
++      errorOf(
++        resolveDispatchedToolCall(dispatcherCall('nope'), registry, DISPATCH)
++      )
++    ).toBe('Tool "nope" is not available through call_tool.');
++    expect(
++      errorOf(
++        resolveDispatchedToolCall(
++          dispatcherCall('lookup_order', '{"query":"1"}'),
++          registry,
++          DISPATCH
++        )
++      )
++    ).toBe(
++      'Tool "lookup_order" is not available through call_tool. It is in your tool list: call it directly.'
++    );
++    expect(
++      errorOf(
++        resolveDispatchedToolCall(
++          dispatcherCall('run_script', '{"query":"1"}'),
++          registry,
++          DISPATCH
++        )
++      )
++    ).toContain('not available through call_tool');
++    expect(
++      errorOf(
++        resolveDispatchedToolCall(
++          dispatcherCall(TOOL_DISPATCHER_NAME),
++          registry,
++          DISPATCH
++        )
++      )
++    ).toContain('not available');
++    expect(
++      errorOf(resolveDispatchedToolCall(dispatcherCall(''), registry, DISPATCH))
++    ).toContain('requires "name"');
++  });
++
++  it('refuses disabled tools whether called directly or through the dispatcher', () => {
++    const expected =
++      'Tool "old_search" is disabled in this conversation: the user turned it off';
++    expect(
++      errorOf(
++        resolveDispatchedToolCall(
++          { id: 'c', name: 'old_search', args: { query: 'x' } },
++          registry
++        )
++      )
++    ).toBe(expected);
++    const deferredOff = new Map(registry).set('old_search', {
++      ...registry.get('old_search')!,
++      defer_loading: true,
++    });
++    expect(
++      errorOf(
++        resolveDispatchedToolCall(
++          dispatcherCall('old_search', '{"query":"x"}'),
++          deferredOff,
++          DISPATCH
++        )
++      )
++    ).toBe(expected);
++  });
++
++  it('refuses arguments that are not a JSON object or do not match the target schema', () => {
++    expect(
++      errorOf(
++        resolveDispatchedToolCall(
++          dispatcherCall('search_wiki', '[1]'),
++          registry,
++          DISPATCH
++        )
++      )
++    ).toBe('The arguments for "search_wiki" must be a JSON object.');
++    expect(
++      errorOf(
++        resolveDispatchedToolCall(
++          dispatcherCall('search_wiki', '{"limit":"many"}'),
++          registry,
++          DISPATCH
++        )
++      )
++    ).toBe(
++      'Invalid arguments for "search_wiki": #: Instance does not have required property "query".; #/limit: Instance type "string" is invalid. Expected "integer".'
++    );
++  });
++
++  it('reads the non-standard float type as number', () => {
++    const floats = new Map([
++      [
++        'measure',
++        {
++          name: 'measure',
++          defer_loading: true,
++          parameters: {
++            type: 'object',
++            properties: { value: { type: 'float' } },
++          },
++        } as t.LCTool,
++      ],
++    ]);
++    expect(
++      'call' in
++        resolveDispatchedToolCall(
++          dispatcherCall('measure', '{"value":1.5}'),
++          floats,
++          DISPATCH
++        )
++    ).toBe(true);
++  });
++});
++
++describe('resolveDispatchedToolCall with schemas the validator cannot apply', () => {
++  const unusable = new Map<string, t.LCTool>([
++    [
++      'bad_pattern',
++      {
++        name: 'bad_pattern',
++        defer_loading: true,
++        parameters: {
++          type: 'object',
++          properties: {
++            year: { type: 'string', pattern: '^(?P<year>\\d{4})$' },
++          },
++        },
++      } as t.LCTool,
++    ],
++    [
++      'bad_ref',
++      {
++        name: 'bad_ref',
++        defer_loading: true,
++        parameters: {
++          type: 'object',
++          properties: { item: { $ref: '#/$defs/missing' } },
++        },
++      } as unknown as t.LCTool,
++    ],
++  ]);
++
++  it.each(['bad_pattern', 'bad_ref'])(
++    'returns an error for %s instead of throwing',
++    (target) => {
++      const args = target === 'bad_ref' ? '{"item":{}}' : '{"year":"2024"}';
++      const resolution = resolveDispatchedToolCall(
++        dispatcherCall(target, args),
++        unusable,
++        DISPATCH
++      );
++      expect(errorOf(resolution)).toContain(
++        `Invalid arguments for "${target}": the tool's schema could not be applied`
++      );
++    }
++  );
++});
++
++describe('resolveDispatchedToolCall with a host target filter', () => {
++  const allowed = {
++    ...DISPATCH,
++    canDispatch: (name: string) => name === 'search_wiki',
++  };
++  const extended = new Map(registry);
++  extended.set('other_deferred', {
++    name: 'other_deferred',
++    parameters: QUERY_SCHEMA,
++    defer_loading: true,
++  });
++
++  it('dispatches only the tools the host declared', () => {
++    expect(
++      'call' in
++        resolveDispatchedToolCall(
++          dispatcherCall('search_wiki', '{"query":"x"}'),
++          extended,
++          allowed
++        )
++    ).toBe(true);
++    expect(
++      errorOf(
++        resolveDispatchedToolCall(
++          dispatcherCall('other_deferred', '{"query":"x"}'),
++          extended,
++          allowed
++        )
++      )
++    ).toBe('Tool "other_deferred" is not available through call_tool.');
++  });
++
++  it('refuses a direct call to an undeclared deferred tool', () => {
++    expect(
++      errorOf(
++        resolveDispatchedToolCall(
++          { id: 'c', name: 'other_deferred', args: { query: 'x' } },
++          extended,
++          allowed
++        )
++      )
++    ).toBe('Tool "other_deferred" is not available through call_tool.');
++  });
++});
++
++function createSchemaStub(name: string): StructuredToolInterface {
++  return tool(async () => 'unused', {
++    name,
++    description: 'schema-only stub; host executes via ON_TOOL_EXECUTE',
++    schema: z.object({ query: z.string() }),
++  }) as unknown as StructuredToolInterface;
++}
++
++type Captured = {
++  requests: t.ToolCallRequest[];
++  completions: t.ProcessedToolCall[];
++};
++
++function captureEvents(output = 'found'): Captured {
++  const captured: Captured = { requests: [], completions: [] };
++  jest
++    .spyOn(events, 'safeDispatchCustomEvent')
++    .mockImplementation(async (event, data) => {
++      if (event === GraphEvents.ON_RUN_STEP_COMPLETED) {
++        captured.completions.push(
++          (data as { result: { tool_call: t.ProcessedToolCall } }).result
++            .tool_call
++        );
++        return;
++      }
++      if (event !== GraphEvents.ON_TOOL_EXECUTE) {
++        return;
++      }
++      const batch = data as t.ToolExecuteBatchRequest;
++      captured.requests.push(...batch.toolCalls);
++      batch.resolve(
++        batch.toolCalls.map((call) => ({
++          toolCallId: call.id,
++          content: `${output}:${call.name}`,
++          status: 'success' as const,
++        }))
++      );
++    });
++  return captured;
++}
++
++function capturePreToolUse(
++  inputs: PreToolUseHookInput[],
++  output: PreToolUseHookOutput = { decision: 'allow' }
++): HookRegistry {
++  const hooks = new HookRegistry();
++  hooks.register('PreToolUse', {
++    hooks: [
++      async (input): Promise<PreToolUseHookOutput> => {
++        inputs.push(input);
++        return output;
++      },
++    ],
++  });
++  return hooks;
++}
++
++function createEventNode(
++  options: Partial<t.ToolNodeConstructorParams> = {}
++): ToolNode {
++  return new ToolNode({
++    tools: DEFINITIONS.map((def) => createSchemaStub(def.name)),
++    eventDrivenMode: true,
++    agentId: 'agent-x',
++    toolDefinitions: registry,
++    toolDispatch: DISPATCH,
++    toolCallStepIds: new Map(
++      ['call_d', 'call_off', 'call_unknown', 'call_bad', 'call_ok'].map(
++        (id) => [id, `step_${id}`]
++      )
++    ),
++    ...options,
++  });
++}
++
++function messagesOf(result: unknown): ToolMessage[] {
++  return (result as { messages: ToolMessage[] }).messages;
++}
++
++describe('ToolNode tool dispatch (event-driven)', () => {
++  afterEach(() => {
++    jest.restoreAllMocks();
++  });
++
++  it('runs the target for hooks and the host, and answers the dispatcher call', async () => {
++    const captured = captureEvents();
++    const hookInputs: PreToolUseHookInput[] = [];
++    const node = createEventNode({
++      hookRegistry: capturePreToolUse(hookInputs),
++    });
++
++    const result = await node.invoke({
++      messages: [
++        new AIMessage({
++          content: '',
++          tool_calls: [dispatcherCall('search_wiki', '{"query":"bolts"}')],
++        }),
++      ],
++    });
++
++    expect(hookInputs).toHaveLength(1);
++    expect(hookInputs[0]).toMatchObject({
++      toolName: 'search_wiki',
++      toolInput: { query: 'bolts' },
++      toolUseId: 'call_d',
++    });
++    expect(captured.requests).toEqual([
++      expect.objectContaining({
++        id: 'call_d',
++        name: 'search_wiki',
++        args: { query: 'bolts' },
++        dispatcher: TOOL_DISPATCHER_NAME,
++      }),
++    ]);
++    const [message] = messagesOf(result);
++    expect(message).toMatchObject({
++      name: TOOL_DISPATCHER_NAME,
++      tool_call_id: 'call_d',
++      content: 'found:search_wiki',
++    });
++    expect(captured.completions).toEqual([
++      expect.objectContaining({
++        id: 'call_d',
++        name: TOOL_DISPATCHER_NAME,
++        args: JSON.stringify({
++          name: 'search_wiki',
++          arguments: '{"query":"bolts"}',
++        }),
++        output: 'found:search_wiki',
++        dispatched: { name: 'search_wiki', args: '{"query":"bolts"}' },
++      }),
++    ]);
++  });
++
++  it('refuses disabled tools, unknown targets, and schema mismatches before any hook or the host', async () => {
++    const captured = captureEvents();
++    const hookInputs: PreToolUseHookInput[] = [];
++    const node = createEventNode({
++      hookRegistry: capturePreToolUse(hookInputs),
++    });
++
++    const result = await node.invoke({
++      messages: [
++        new AIMessage({
++          content: '',
++          tool_calls: [
++            { id: 'call_off', name: 'old_search', args: { query: 'x' } },
++            dispatcherCall('nope', '{}', 'call_unknown'),
++            dispatcherCall('search_wiki', '{"limit":1}', 'call_bad'),
++            { id: 'call_ok', name: 'lookup_order', args: { query: '42' } },
++          ],
++        }),
++      ],
++    });
++
++    expect(hookInputs.map((input) => input.toolName)).toEqual(['lookup_order']);
++    expect(captured.requests.map((request) => request.name)).toEqual([
++      'lookup_order',
++    ]);
++    const byId = new Map(
++      messagesOf(result).map((message) => [message.tool_call_id, message])
++    );
++    expect(byId.get('call_ok')).toMatchObject({ status: 'success' });
++    expect(byId.get('call_off')).toMatchObject({
++      status: 'error',
++      name: 'old_search',
++      content: expect.stringContaining(
++        'Tool "old_search" is disabled in this conversation'
++      ),
++    });
++    expect(byId.get('call_unknown')).toMatchObject({
++      status: 'error',
++      name: TOOL_DISPATCHER_NAME,
++      content: expect.stringContaining('"nope" is not available'),
++    });
++    expect(byId.get('call_bad')).toMatchObject({
++      status: 'error',
++      name: TOOL_DISPATCHER_NAME,
++      content: expect.stringContaining('Invalid arguments for "search_wiki"'),
++    });
++    expect(captured.completions).toEqual(
++      expect.arrayContaining([
++        expect.objectContaining({ id: 'call_off', name: 'old_search' }),
++      ])
++    );
++  });
++
++  it('answers a call whose target schema cannot be applied with a tool error', async () => {
++    captureEvents();
++    const broken: t.LCTool = {
++      name: 'broken_schema',
++      defer_loading: true,
++      parameters: {
++        type: 'object',
++        properties: { year: { type: 'string', pattern: '^(?P<y>\\d+)$' } },
++      },
++    };
++    const node = createEventNode({
++      toolDefinitions: new Map([...registry, ['broken_schema', broken]]),
++    });
++
++    const result = await node.invoke({
++      messages: [
++        new AIMessage({
++          content: '',
++          tool_calls: [dispatcherCall('broken_schema', '{"year":"1"}')],
++        }),
++      ],
++    });
++
++    expect(messagesOf(result)[0]).toMatchObject({
++      status: 'error',
++      name: TOOL_DISPATCHER_NAME,
++      content: expect.stringContaining('schema could not be applied'),
++    });
++  });
++
++  it('keeps today\'s behaviour when the dispatcher is not enabled', async () => {
++    const captured = captureEvents();
++    const node = createEventNode({ toolDispatch: undefined });
++
++    await node.invoke({
++      messages: [
++        new AIMessage({
++          content: '',
++          tool_calls: [dispatcherCall('search_wiki', '{"query":"x"}')],
++        }),
++      ],
++    });
++
++    expect(captured.requests).toEqual([
++      expect.objectContaining({ name: TOOL_DISPATCHER_NAME }),
++    ]);
++    expect(captured.requests[0].dispatcher).toBeUndefined();
++  });
++});
++
++describe('ToolNode tool dispatch of direct calls to dispatchable tools', () => {
++  afterEach(() => {
++    jest.restoreAllMocks();
++  });
++
++  it('runs the target for hooks and rewrites the call into a dispatcher call', async () => {
++    const captured = captureEvents();
++    const hookInputs: PreToolUseHookInput[] = [];
++    const node = createEventNode({
++      hookRegistry: capturePreToolUse(hookInputs),
++    });
++    const args = { query: 'bolts' };
++
++    const result = await node.invoke({
++      messages: [
++        new AIMessage({
++          id: 'msg_direct',
++          content: [
++            {
++              type: 'tool_use',
++              id: 'call_d',
++              name: 'search_wiki',
++              input: args,
++            },
++          ],
++          tool_calls: [{ id: 'call_d', name: 'search_wiki', args }],
++        }),
++      ],
++    });
++
++    expect(hookInputs[0]).toMatchObject({
++      toolName: 'search_wiki',
++      toolInput: args,
++    });
++    expect(captured.requests).toEqual([
++      expect.objectContaining({
++        name: 'search_wiki',
++        dispatcher: TOOL_DISPATCHER_NAME,
++      }),
++    ]);
++    const modelArgs = {
++      name: 'search_wiki',
++      arguments: JSON.stringify(args),
++    };
++    const [replacement, message] = (
++      result as { messages: Array<AIMessage | ToolMessage> }
++    ).messages;
++    expect(replacement).toBeInstanceOf(AIMessage);
++    expect(replacement).toMatchObject({
++      id: 'msg_direct',
++      tool_calls: [
++        expect.objectContaining({
++          id: 'call_d',
++          name: TOOL_DISPATCHER_NAME,
++          args: modelArgs,
++        }),
++      ],
++      content: [
++        {
++          type: 'tool_use',
++          id: 'call_d',
++          name: TOOL_DISPATCHER_NAME,
++          input: modelArgs,
++        },
++      ],
++    });
++    expect(message).toMatchObject({
++      name: TOOL_DISPATCHER_NAME,
++      tool_call_id: 'call_d',
++    });
++    expect(captured.completions).toEqual([
++      expect.objectContaining({
++        name: TOOL_DISPATCHER_NAME,
++        args: JSON.stringify(modelArgs),
++        dispatched: { name: 'search_wiki', args: JSON.stringify(args) },
++      }),
++    ]);
++  });
++});
++
++describe('tool_search with a dispatcher', () => {
++  const searchRegistry = new Map(DEFINITIONS.map((def) => [def.name, def]));
++
++  async function search(toolDispatch?: string): Promise<string> {
++    const toolSearch = createToolSearch({
++      mode: 'local',
++      toolRegistry: searchRegistry,
++      toolDispatch,
++    });
++    const output = await toolSearch.invoke({
++      id: 'call_search',
++      name: 'tool_search',
++      args: { query: 'wiki' },
++      type: 'tool_call',
++    });
++    return String((output as ToolMessage).content);
++  }
++
++  it('lists full names and schemas and tells the model to use the dispatcher', async () => {
++    const result = JSON.parse(await search(TOOL_DISPATCHER_NAME)) as {
++      tools: Array<{ name: string; parameters?: unknown }>;
++      call_with?: string;
++    };
++    expect(result.tools).toEqual([
++      expect.objectContaining({
++        name: 'search_wiki',
++        parameters: QUERY_SCHEMA,
++      }),
++    ]);
++    expect(result.call_with).toContain(`Call one with ${TOOL_DISPATCHER_NAME}`);
++  });
++
++  it('keeps today\'s output without a dispatcher', async () => {
++    const result = JSON.parse(await search()) as Record<string, unknown>;
++    expect(result.call_with).toBeUndefined();
++    expect(JSON.stringify(result)).not.toContain('"parameters"');
++  });
++});
++
++describe('ToolNode tool dispatch (in-graph tools)', () => {
++  it('invokes the target tool instance with lifecycle hooks seeing the target', async () => {
++    const executed: unknown[] = [];
++    const searchWiki = tool(
++      async (args: { query: string }) => {
++        executed.push(args);
++        return `wiki:${args.query}`;
++      },
++      {
++        name: 'search_wiki',
++        description: 'Made available mid-conversation.',
++        schema: z.object({ query: z.string() }),
++      }
++    ) as unknown as StructuredToolInterface;
++    const hookInputs: PreToolUseHookInput[] = [];
++    const node = new ToolNode({
++      tools: [searchWiki],
++      toolRegistry: registry,
++      toolDispatch: DISPATCH,
++      hookRegistry: capturePreToolUse(hookInputs),
++    });
++
++    const result = await node.invoke({
++      messages: [
++        new AIMessage({
++          content: '',
++          tool_calls: [dispatcherCall('search_wiki', '{"query":"gears"}')],
++        }),
++      ],
++    });
++
++    expect(executed).toEqual([{ query: 'gears' }]);
++    expect(hookInputs[0]).toMatchObject({
++      toolName: 'search_wiki',
++      toolInput: { query: 'gears' },
++    });
++    expect(messagesOf(result)[0]).toMatchObject({
++      name: TOOL_DISPATCHER_NAME,
++      tool_call_id: 'call_d',
++      content: 'wiki:gears',
++    });
++  });
++});
++
++describe('ToolNode tool dispatch with human-in-the-loop approval', () => {
++  afterEach(() => {
++    jest.restoreAllMocks();
++  });
++
++  it('asks for approval of the target and runs the edited target arguments', async () => {
++    const captured = captureEvents('ran');
++    const hooks = new HookRegistry();
++    hooks.register('PreToolUse', {
++      hooks: [createToolPolicyHook({ mode: 'bypass', ask: ['search_*'] })],
++    });
++    const node = createEventNode({
++      hookRegistry: hooks,
++      humanInTheLoop: { enabled: true },
++    });
++    const call = dispatcherCall('search_wiki', '{"query":"secret"}');
++    const graph = new StateGraph(MessagesAnnotation)
++      .addNode('agent', (state: { messages?: BaseMessage[] }) => ({
++        messages:
++          state.messages?.some((message) => message._getType() === 'tool') ===
++          true
++            ? [new AIMessage('done')]
++            : [new AIMessage({ content: '', tool_calls: [call] })],
++      }))
++      .addNode('tools', node)
++      .addEdge(START, 'agent')
++      .addEdge('agent', 'tools')
++      .addEdge('tools', END)
++      .compile({ checkpointer: new MemorySaver() });
++    const config: RunnableConfig = {
++      configurable: { thread_id: 'thread-dispatch-hitl' },
++    };
++
++    const interrupted = await graph.invoke({ messages: [] }, config);
++
++    if (!isInterrupted<t.HumanInterruptPayload>(interrupted)) {
++      throw new Error('expected interrupt');
++    }
++    const payload = interrupted.__interrupt__[0].value!;
++    if (payload.type !== 'tool_approval') {
++      throw new Error('expected tool_approval payload');
++    }
++    expect(payload.action_requests).toEqual([
++      expect.objectContaining({
++        tool_call_id: 'call_d',
++        name: 'search_wiki',
++        arguments: { query: 'secret' },
++      }),
++    ]);
++    expect(captured.requests).toEqual([]);
++
++    const resumed = (await graph.invoke(
++      new Command({
++        resume: {
++          [interrupted.__interrupt__[0].id!]: [
++            { type: 'edit', updatedInput: { query: 'public' } },
++          ],
++        },
++      }),
++      {
++        ...config,
++        configurable: {
++          ...config.configurable,
++          [TOOL_BATCH_REPLAY_KEY]: getToolBatchReplayState(
++            interrupted.__interrupt__[0].value
++          ),
++        },
++      }
++    )) as { messages: BaseMessage[] };
++
++    expect(captured.requests).toEqual([
++      expect.objectContaining({
++        id: 'call_d',
++        name: 'search_wiki',
++        args: { query: 'public' },
++      }),
++    ]);
++    const toolMessage = resumed.messages.find(
++      (message) => message._getType() === 'tool'
++    ) as ToolMessage;
++    expect(toolMessage).toMatchObject({
++      name: TOOL_DISPATCHER_NAME,
++      tool_call_id: 'call_d',
++      content: 'ran:search_wiki',
++    });
++  });
++});
++
++describe('AgentContext tool dispatch binding', () => {
++  function boundNames(agentContext: AgentContext): string[] {
++    return (agentContext.getToolsForBinding() ?? []).map((boundTool) =>
++      'name' in boundTool ? String(boundTool.name) : ''
++    );
++  }
++
++  function createContext(toolDispatch?: true): AgentContext {
++    return AgentContext.fromConfig({
++      agentId: 'agent-x',
++      provider: Providers.OPENAI,
++      toolDefinitions: DEFINITIONS,
++      toolRegistry: registry,
++      toolDispatch,
++    } as t.AgentInputs);
++  }
++
++  it('binds the dispatcher last and never binds deferred tools, even when discovered', () => {
++    const agentContext = createContext(true);
++    expect(boundNames(agentContext)).toEqual([
++      'lookup_order',
++      'old_search',
++      TOOL_DISPATCHER_NAME,
++    ]);
++    agentContext.markToolsAsDiscovered(['search_wiki']);
++    expect(boundNames(agentContext)).toEqual([
++      'lookup_order',
++      'old_search',
++      TOOL_DISPATCHER_NAME,
++    ]);
++  });
++
++  it('binds discovered deferred tools as before without the dispatcher', () => {
++    const agentContext = createContext();
++    agentContext.markToolsAsDiscovered(['search_wiki']);
++    expect(boundNames(agentContext)).toEqual([
++      'lookup_order',
++      'search_wiki',
++      'old_search',
++    ]);
++  });
++
++  it('exposes the dispatcher definition with a string arguments field', () => {
++    expect(createToolDispatcherDefinition({ name: 'use_tool' })).toMatchObject({
++      name: 'use_tool',
++      parameters: {
++        properties: { arguments: { type: 'string' } },
++        required: ['name'],
++      },
++    });
++  });
++});

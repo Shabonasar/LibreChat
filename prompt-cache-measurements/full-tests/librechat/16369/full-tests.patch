@@ -1,0 +1,1996 @@
+diff --git a/api/server/controllers/agents/client.test.js b/api/server/controllers/agents/client.test.js
+index 6e3537b10..d4bbe6ec3 100644
+--- a/api/server/controllers/agents/client.test.js
++++ b/api/server/controllers/agents/client.test.js
+@@ -5716,6 +5716,41 @@ describe('AgentClient - titleConvo', () => {
+ 
+       expect(client.augmentedPrompt).toBe('Retrieved context');
+       expect(client.options.agent.additional_instructions).toContain('Retrieved context');
++      expect(client.options.agent.volatile_instructions).toBe('Retrieved context');
++    });
++
++    it('records the memory and RAG context as the volatile part, apart from the stable part', async () => {
++      client.contextHandlers = { createContext: jest.fn().mockResolvedValue('Retrieved context') };
++      client.useMemory = jest
++        .fn()
++        .mockResolvedValue({ withKeys: 'Memory note', withoutKeys: 'Memory note' });
++      client.options.agent.additional_instructions = 'Static artifacts prompt';
++
++      await client.buildMessages(
++        [
++          {
++            messageId: 'msg-1',
++            parentMessageId: null,
++            sender: 'User',
++            text: 'Hello',
++            isCreatedByUser: true,
++          },
++        ],
++        null,
++        {},
++      );
++
++      const {
++        additional_instructions: additional,
++        volatile_instructions: volatile,
++        stable_additional_instructions: stable,
++        split_additional_instructions: source,
++      } = client.options.agent;
++      expect(volatile.startsWith('Retrieved context\n\n')).toBe(true);
++      expect(volatile.endsWith('Memory note')).toBe(true);
++      expect(stable).toBe('Static artifacts prompt');
++      expect(source).toBe(additional);
++      expect(additional).toBe(`Static artifacts prompt\n\n${volatile}`);
+     });
+ 
+     it('starts independent context and current-file work at their earliest dependency barriers', async () => {
+@@ -7785,7 +7820,7 @@ describe('AgentClient - titleConvo', () => {
+     });
+ 
+     describe('context updates', () => {
+-      const history = () => [
++      const conversationHistory = () => [
+         {
+           messageId: 'msg-1',
+           parentMessageId: null,
+@@ -7814,128 +7849,67 @@ describe('AgentClient - titleConvo', () => {
+       ];
+ 
+       beforeEach(() => {
+-        mockReq.config.endpoints = {
+-          [EModelEndpoint.agents]: { promptCache: { stableContext: true } },
+-        };
+         mockReq.conversationCreatedAt = '2026-03-09T20:00:00.000Z';
+         mockReq.turnStartedAt = Date.parse('2026-03-10T09:00:00.000Z');
+         mockReq.body.timezone = 'UTC';
+-        mockAgent.dynamicToolContextMap = { web_search: 'Conversation Date & Time: ...' };
+-        require('@librechat/api').countFormattedMessageTokens.mockImplementation(({ content }) =>
+-          String(content).includes('<context_update>') ? 90 : 10,
+-        );
++        require('@librechat/api').countFormattedMessageTokens.mockImplementation(({ content }) => {
++          const text = Array.isArray(content)
++            ? content.map((part) => part.text ?? '').join('\n')
++            : String(content ?? '');
++          return text.includes('<context_update>') ? 90 : 10;
++        });
+       });
+ 
+-      it('announces a later date in the prompt copy only, where the prompt states a date', async () => {
+-        const result = await client.buildMessages(history(), 'msg-3', {});
++      it('prepends a date change to the prompt copy only and counts it for the prompt', async () => {
++        mockAgent.dynamicToolContextMap = { web_search: 'Conversation started: ...' };
++        mockReq.config.endpoints = {
++          [EModelEndpoint.agents]: { promptCache: { stableContext: true } },
++        };
++
++        const result = await client.buildMessages(conversationHistory(), 'msg-3', {});
+ 
+         expect(result.prompt[0].content).toBe('First question');
+         expect(result.prompt[2].content).toBe(
+-          '<context_update>\nCurrent date changed to: 2026-03-10 (Tuesday)\n</context_update>\n\nNext question',
++          '<context_update>\nCurrent date changed to: 2026-03-10 (Tue)\n</context_update>\n\nNext question',
+         );
+         expect(result.tokenCountMap['msg-3']).toBe(10);
+         expect(client.indexTokenCountMap[2]).toBe(90);
+         expect(client.memoryPayload[2].content).toBe('Next question');
+-
+-        mockAgent.dynamicToolContextMap = {};
+-        const withoutDate = await client.buildMessages(history(), 'msg-3', {});
+-        expect(withoutDate.prompt[2].content).toBe('Next question');
+       });
+ 
+-      it('stamps every user message with its send time with promptMessageTimestamps', async () => {
++      it('stamps every user message with its send time when promptMessageTimestamps is on', async () => {
+         mockReq.config.endpoints = { [EModelEndpoint.agents]: { promptMessageTimestamps: true } };
+ 
+-        const result = await client.buildMessages(history(), 'msg-3', {});
++        const result = await client.buildMessages(conversationHistory(), 'msg-3', {});
+ 
+         expect(result.prompt[0].content).toBe(
+-          '<context_update>\nMessage sent: 2026-03-09 20:00:00 +00:00 (Monday)\n</context_update>\n\nFirst question',
++          '<context_update>\nMessage sent: 2026-03-09 20:00:00 +00:00 (Mon)\n</context_update>\n\nFirst question',
+         );
+         expect(result.prompt[2].content).toBe(
+-          '<context_update>\nMessage sent: 2026-03-10 09:00:00 +00:00 (Tuesday)\n</context_update>\n\nNext question',
++          '<context_update>\nMessage sent: 2026-03-10 09:00:00 +00:00 (Tue)\n</context_update>\n\nNext question',
+         );
+         expect(client.memoryPayload[0].content).toBe('First question');
+       });
+ 
+-      it('builds the prompt exactly as upstream without the settings', async () => {
+-        mockReq.config.endpoints = {};
+-        client.options.agent.additional_instructions = 'Agent context';
++      it('leaves messages untouched without stableContext, even when a prompt states the date', async () => {
++        mockAgent.dynamicToolContextMap = { web_search: 'Conversation Date & Time: ...' };
+ 
+-        const result = await client.buildMessages(history(), 'msg-3', {});
++        const result = await client.buildMessages(conversationHistory(), 'msg-3', {});
+ 
+-        expect({
+-          prompt: result.prompt,
+-          tokenCountMap: result.tokenCountMap,
+-          indexTokenCountMap: client.indexTokenCountMap,
+-          memoryPayload: client.memoryPayload,
+-          instructions: client.options.agent.instructions,
+-          additional_instructions: client.options.agent.additional_instructions,
+-        }).toMatchInlineSnapshot(`
+-          {
+-            "additional_instructions": "Agent context",
+-            "indexTokenCountMap": {
+-              "0": 5,
+-              "1": 5,
+-              "2": 10,
+-            },
+-            "instructions": "Primary instructions",
+-            "memoryPayload": null,
+-            "prompt": [
+-              {
+-                "content": "First question",
+-                "messageId": "msg-1",
+-                "role": "user",
+-              },
+-              {
+-                "content": "First answer",
+-                "messageId": "msg-2",
+-                "role": "assistant",
+-              },
+-              {
+-                "content": "Next question",
+-                "messageId": "msg-3",
+-                "role": "user",
+-              },
+-            ],
+-            "tokenCountMap": {
+-              "msg-1": 5,
+-              "msg-2": 5,
+-              "msg-3": 10,
+-            },
+-          }
+-        `);
++        expect(result.prompt[2].content).toBe('Next question');
++        expect(client.memoryPayload).toBeNull();
+       });
+ 
+-      it('compares the first message after a summary with the conversation start date', async () => {
+-        const messages = history();
+-        messages[1].content = [{ type: ContentTypes.SUMMARY, text: 'Earlier talk' }];
+-        messages.splice(
+-          1,
+-          0,
+-          {
+-            messageId: 'msg-0a',
+-            parentMessageId: 'msg-1',
+-            sender: 'Assistant',
+-            text: 'Old answer',
+-            isCreatedByUser: false,
+-            tokenCount: 5,
+-          },
+-          {
+-            messageId: 'msg-0b',
+-            parentMessageId: 'msg-0a',
+-            sender: 'User',
+-            text: 'Morning question',
+-            isCreatedByUser: true,
+-            createdAt: '2026-03-10T08:00:00.000Z',
+-            tokenCount: 5,
+-          },
+-        );
+-        messages[3].parentMessageId = 'msg-0b';
++      it('leaves messages untouched when no prompt states the conversation date', async () => {
++        mockReq.config.endpoints = {
++          [EModelEndpoint.agents]: { promptCache: { stableContext: true } },
++        };
+ 
+-        const result = await client.buildMessages(messages, 'msg-3', {});
++        const result = await client.buildMessages(conversationHistory(), 'msg-3', {});
+ 
+-        expect(result.prompt[4].content).toBe(
+-          '<context_update>\nCurrent date changed to: 2026-03-10 (Tuesday)\n</context_update>\n\nNext question',
+-        );
++        expect(result.prompt[2].content).toBe('Next question');
++        expect(client.indexTokenCountMap[2]).toBe(10);
++        expect(client.memoryPayload).toBeNull();
+       });
+     });
+ 
+@@ -8935,56 +8909,9 @@ describe('AgentClient - titleConvo', () => {
+       expect(parallelAgent2.additional_instructions ?? '').not.toContain(memoryContent);
+     });
+ 
+-    it('keeps empty-store memory guidance out of an agent that cannot use memory', async () => {
+-      const { memoryInstructions } = require('@librechat/api');
+-      client.useMemory = jest.fn().mockResolvedValue({ withKeys: '', withoutKeys: '' });
+-      client.agentConfigs = new Map();
+-
+-      await client.buildMessages(
+-        [
+-          {
+-            messageId: 'msg-1',
+-            parentMessageId: null,
+-            sender: 'User',
+-            text: 'Translate this',
+-            isCreatedByUser: true,
+-          },
+-        ],
+-        null,
+-        { instructions: 'Base instructions', additional_instructions: null },
+-      );
+-
+-      expect(client.options.agent.additional_instructions ?? '').not.toContain(memoryInstructions);
+-    });
+-
+-    it('tells a primary agent with memory tools about persistent memory when the store is empty', async () => {
++    it('tells the primary read-only agent about persistent memory when the store is empty', async () => {
+       const { memoryInstructions } = require('@librechat/api');
+       client.useMemory = jest.fn().mockResolvedValue({ withKeys: '', withoutKeys: '' });
+-      client.options.agent.memoryToolsRegistered = true;
+-      client.agentConfigs = new Map();
+-
+-      await client.buildMessages(
+-        [
+-          {
+-            messageId: 'msg-1',
+-            parentMessageId: null,
+-            sender: 'User',
+-            text: 'Remember that I like tea',
+-            isCreatedByUser: true,
+-          },
+-        ],
+-        null,
+-        { instructions: 'Base instructions', additional_instructions: null },
+-      );
+-
+-      expect(client.options.agent.additional_instructions).toContain(memoryInstructions);
+-      expect(client.options.agent.additional_instructions).not.toContain('# Existing memory');
+-    });
+-
+-    it('tells the primary read-only agent about persistent memory when the store is empty and automatic extraction is on', async () => {
+-      const { memoryInstructions } = require('@librechat/api');
+-      client.useMemory = jest.fn().mockResolvedValue({ withKeys: '', withoutKeys: '' });
+-      mockReq.config.memory.agent = { enabled: true, id: 'memory-agent' };
+       const parallelAgent = {
+         id: 'parallel-agent-1',
+         instructions: 'Parallel instructions',
+@@ -9009,6 +8936,7 @@ describe('AgentClient - titleConvo', () => {
+       expect(client.options.agent.additional_instructions).toContain(memoryInstructions);
+       expect(client.options.agent.additional_instructions).not.toContain('# Existing memory');
+       expect(client.options.agent.additional_instructions).not.toContain('set_memory');
++      expect(parallelAgent.additional_instructions ?? '').not.toContain(memoryInstructions);
+     });
+ 
+     it('keeps memory guidance out of agents when memory was unavailable', async () => {
+diff --git a/api/server/services/__tests__/ToolService.spec.js b/api/server/services/__tests__/ToolService.spec.js
+index 8cb1ad44e..84c63f8ae 100644
+--- a/api/server/services/__tests__/ToolService.spec.js
++++ b/api/server/services/__tests__/ToolService.spec.js
+@@ -193,7 +193,7 @@ const {
+ } = require('../ToolService');
+ const { createOnSearchResults } = require('~/server/services/Tools/search');
+ const { reinitMCPServer } = require('~/server/services/Tools/mcp');
+-const { ContentFilterError, PENDING_STALE_MS, ToolInputError } = require('@librechat/api');
++const { ContentFilterError, PENDING_STALE_MS } = require('@librechat/api');
+ 
+ /** Role document shape `checkAccess` reads; all three role-gated tools granted. */
+ function buildRole(overrides = {}) {
+@@ -689,46 +689,6 @@ describe('ToolService - Action Capability Gating', () => {
+       expect(output).not.toContain('bearer_header');
+     });
+ 
+-    it('returns approved tool error text instead of a raw exception message', async () => {
+-      const rawMessage =
+-        'connect ECONNREFUSED 10.0.0.5:443 for https://api.example.test/?q=PRIVATE';
+-      mockLoadToolsUtil.mockResolvedValue({
+-        loadedTools: [
+-          { name: 'safe_tool', _call: jest.fn().mockRejectedValue(new Error(rawMessage)) },
+-        ],
+-        toolContextMap: {},
+-      });
+-
+-      const result = await processRequiredActions(buildClient(undefined), [buildAction()]);
+-
+-      expect(result.tool_outputs).toEqual([
+-        {
+-          tool_call_id: 'call_1',
+-          output: 'Error processing tool safe_tool: The tool request failed.',
+-        },
+-      ]);
+-    });
+-
+-    it('keeps the message of a tool input error the tool wrote for the model', async () => {
+-      mockLoadToolsUtil.mockResolvedValue({
+-        loadedTools: [
+-          {
+-            name: 'safe_tool',
+-            _call: jest
+-              .fn()
+-              .mockRejectedValue(new ToolInputError('Could not find coordinates for city: Rome')),
+-          },
+-        ],
+-        toolContextMap: {},
+-      });
+-
+-      const result = await processRequiredActions(buildClient(undefined), [buildAction()]);
+-
+-      expect(result.tool_outputs[0].output).toBe(
+-        'Error processing tool safe_tool: Could not find coordinates for city: Rome',
+-      );
+-    });
+-
+     it('blocks persisted Assistant action metadata before required-action execution', async () => {
+       const actionToolName = `get_weather${actionDelimiter}api_example_com`;
+       const filters = {
+@@ -1237,46 +1197,6 @@ describe('ToolService - Action Capability Gating', () => {
+       expect(callArgs.tools).not.toContain(actionToolName);
+     });
+ 
+-    it('dates the web search context by the turn start as upstream without stableContext', async () => {
+-      const capabilities = [AgentCapabilities.tools, AgentCapabilities.web_search];
+-      const req = createMockReq(capabilities);
+-      req.conversationCreatedAt = '2026-08-25T10:00:00.000Z';
+-      req.turnStartedAt = Date.parse('2026-08-31T06:20:00.000Z');
+-      mockGetEndpointsConfig.mockResolvedValue(createEndpointsConfig(capabilities));
+-
+-      const result = await loadAgentTools({
+-        req,
+-        res: {},
+-        agent: { id: 'agent_123', tools: [Tools.web_search] },
+-        definitionsOnly: true,
+-      });
+-
+-      expect(result.dynamicToolContextMap).toMatchInlineSnapshot(`
+-        {
+-          "web_search": "# \`web_search\` Runtime Context
+-        Conversation Date & Time: 2026-08-31T06:20:00.000Z",
+-        }
+-      `);
+-    });
+-
+-    it('dates the web search context by the conversation start with stableContext', async () => {
+-      const capabilities = [AgentCapabilities.tools, AgentCapabilities.web_search];
+-      const req = createMockReq(capabilities);
+-      req.config.endpoints[EModelEndpoint.agents].promptCache = { stableContext: true };
+-      req.conversationCreatedAt = '2026-08-25T10:00:00.000Z';
+-      req.turnStartedAt = Date.parse('2026-08-31T06:20:00.000Z');
+-      mockGetEndpointsConfig.mockResolvedValue(createEndpointsConfig(capabilities));
+-
+-      const result = await loadAgentTools({
+-        req,
+-        res: {},
+-        agent: { id: 'agent_123', tools: [Tools.web_search] },
+-        definitionsOnly: true,
+-      });
+-
+-      expect(result.dynamicToolContextMap[Tools.web_search]).toContain('2026-08-25T10:00:00.000Z');
+-    });
+-
+     it('should include action tools in definitions when actions capability is enabled', async () => {
+       const capabilities = [AgentCapabilities.tools, AgentCapabilities.actions];
+       const req = createMockReq(capabilities);
+diff --git a/packages/api/src/agents/__tests__/initialize.test.ts b/packages/api/src/agents/__tests__/initialize.test.ts
+index 9243f0b61..2193e4769 100644
+--- a/packages/api/src/agents/__tests__/initialize.test.ts
++++ b/packages/api/src/agents/__tests__/initialize.test.ts
+@@ -2189,10 +2189,11 @@ describe('initializeAgent — stable and dynamic instruction fields', () => {
+     jest.clearAllMocks();
+   });
+ 
+-  it('moves instructions with temporal special vars into the dynamic tail using the turn start', async () => {
++  it('moves instructions with temporal special vars into the dynamic tail anchored to the conversation start', async () => {
+     const { agent, req, res, loadTools, db } = createMocks();
+     agent.instructions =
+-      'Today is {{current_date}}. The turn began at {{current_datetime}} ({{iso_datetime}}).';
++      'Today is {{current_date}}. The chat began at {{current_datetime}} ({{iso_datetime}}).';
++    req.config = { endpoints: { agents: { promptCache: { stableContext: true } } } } as never;
+     req.conversationCreatedAt = '2026-08-25T10:00:00.000Z';
+     req.turnStartedAt = new Date('2026-08-31T06:20:00.000Z').getTime();
+     req.body = { timezone: 'UTC' };
+@@ -2211,30 +2212,18 @@ describe('initializeAgent — stable and dynamic instruction fields', () => {
+     );
+ 
+     expect(result.instructions).toBeUndefined();
+-    expect(result.additional_instructions).toBe(
+-      'Today is 2026-08-31 (Monday). The turn began at 2026-08-31 06:20:00 +00:00 (Monday) (2026-08-31T06:20:00.000Z).',
++    expect(result.additional_instructions).toBeUndefined();
++    expect(result.dynamicToolContextMap?.agent_temporal_instructions).toBe(
++      'Today is 2026-08-25 (Tuesday). The chat began at 2026-08-25 10:00:00 +00:00 (Tuesday) (2026-08-25T10:00:00.000Z).',
+     );
+   });
+ 
+-  it('builds the instruction fields exactly as upstream without stableContext', async () => {
+-    const { generateArtifactsPrompt } = jest.requireMock('~/prompts') as {
+-      generateArtifactsPrompt: jest.Mock;
+-    };
+-    generateArtifactsPrompt.mockReturnValueOnce('Artifact guidance');
++  it('resolves temporal special vars in the request timezone, from the turn start without a conversation anchor', async () => {
+     const { agent, req, res, loadTools, db } = createMocks();
+-    loadTools.mockResolvedValueOnce({
+-      tools: [],
+-      toolContextMap: { web_search: 'Web search instructions' },
+-      dynamicToolContextMap: { web_search: 'Conversation Date & Time: turn' },
+-      toolDefinitions: [],
+-      hasDeferredTools: false,
+-    });
+-    agent.instructions = 'Today is {{current_date}}, at {{current_datetime}}.';
+-    agent.additional_instructions = 'Agent context';
+-    agent.artifacts = 'enabled' as never;
+-    req.conversationCreatedAt = '2026-08-25T10:00:00.000Z';
+-    req.turnStartedAt = new Date('2026-08-31T06:20:00.000Z').getTime();
+-    req.body = { timezone: 'Europe/Moscow' };
++    agent.instructions = 'It is currently {{current_datetime}}.';
++    req.config = { endpoints: { agents: { promptCache: { stableContext: true } } } } as never;
++    req.turnStartedAt = new Date('2024-01-15T18:30:00.000Z').getTime();
++    req.body = { timezone: 'America/New_York' };
+ 
+     const result = await initializeAgent(
+       {
+@@ -2249,35 +2238,32 @@ describe('initializeAgent — stable and dynamic instruction fields', () => {
+       db,
+     );
+ 
+-    expect({
+-      instructions: result.instructions,
+-      additional_instructions: result.additional_instructions,
+-      toolContextMap: result.toolContextMap,
+-      dynamicToolContextMap: result.dynamicToolContextMap,
+-    }).toMatchInlineSnapshot(`
+-      {
+-        "additional_instructions": "Agent context
+-
+-      Today is 2026-08-31 (Monday), at 2026-08-31 09:20:00 +03:00 (Monday).
+-
+-      Artifact guidance",
+-        "dynamicToolContextMap": {
+-          "web_search": "Conversation Date & Time: turn",
+-        },
+-        "instructions": undefined,
+-        "toolContextMap": {
+-          "web_search": "Web search instructions",
+-        },
+-      }
+-    `);
++    expect(result.instructions).toBeUndefined();
++    expect(result.additional_instructions).toBeUndefined();
++    expect(result.dynamicToolContextMap?.agent_temporal_instructions).toBe(
++      'It is currently 2024-01-15 13:30:00 -05:00 (Monday).',
++    );
+   });
+ 
+-  it('anchors temporal special vars to the conversation start with stableContext', async () => {
++  it('keeps artifact guidance before all per-turn context without mutating shared tool context', async () => {
++    const { generateArtifactsPrompt } = jest.requireMock('~/prompts') as {
++      generateArtifactsPrompt: jest.Mock;
++    };
++    generateArtifactsPrompt.mockReturnValue('Artifact guidance');
++
+     const { agent, req, res, loadTools, db } = createMocks();
++    const webContext = { web_search: 'Conversation Date & Time: 2026-08-31T06:20:00.000Z' };
++    loadTools.mockResolvedValueOnce({
++      tools: [],
++      toolContextMap: {},
++      dynamicToolContextMap: webContext,
++      toolDefinitions: [],
++      hasDeferredTools: false,
++    });
++    agent.additional_instructions = 'Stable agent context';
+     agent.instructions = 'Today is {{current_date}}.';
+-    agent.additional_instructions = 'Agent context';
++    agent.artifacts = 'enabled' as never;
+     req.config = { endpoints: { agents: { promptCache: { stableContext: true } } } } as never;
+-    req.conversationCreatedAt = '2026-08-25T10:00:00.000Z';
+     req.turnStartedAt = new Date('2026-08-31T06:20:00.000Z').getTime();
+     req.body = { timezone: 'UTC' };
+ 
+@@ -2294,18 +2280,23 @@ describe('initializeAgent — stable and dynamic instruction fields', () => {
+       db,
+     );
+ 
+-    expect(result.instructions).toBeUndefined();
+-    expect(result.additional_instructions).toBe('Agent context');
++    expect(result.additional_instructions).toBe('Stable agent context\n\nArtifact guidance');
+     expect(result.dynamicToolContextMap).toEqual({
+-      agent_temporal_instructions: 'Today is 2026-08-25 (Tuesday).',
++      ...webContext,
++      agent_temporal_instructions: 'Today is 2026-08-31 (Monday).',
++    });
++    expect(webContext).toEqual({
++      web_search: 'Conversation Date & Time: 2026-08-31T06:20:00.000Z',
+     });
+   });
+ 
+-  it('resolves temporal special vars in the request timezone', async () => {
++  it('keeps temporal instructions in additional_instructions, dated by the turn start, when stableContext is off', async () => {
+     const { agent, req, res, loadTools, db } = createMocks();
+-    agent.instructions = 'It is currently {{current_datetime}}.';
+-    req.turnStartedAt = new Date('2024-01-15T18:30:00.000Z').getTime();
+-    req.body = { timezone: 'America/New_York' };
++    agent.instructions =
++      'Today is {{current_date}}. The turn began at {{current_datetime}} ({{iso_datetime}}).';
++    req.conversationCreatedAt = '2026-08-25T10:00:00.000Z';
++    req.turnStartedAt = new Date('2026-08-31T06:20:00.000Z').getTime();
++    req.body = { timezone: 'UTC' };
+ 
+     const result = await initializeAgent(
+       {
+@@ -2322,8 +2313,9 @@ describe('initializeAgent — stable and dynamic instruction fields', () => {
+ 
+     expect(result.instructions).toBeUndefined();
+     expect(result.additional_instructions).toBe(
+-      'It is currently 2024-01-15 13:30:00 -05:00 (Monday).',
++      'Today is 2026-08-31 (Monday). The turn began at 2026-08-31 06:20:00 +00:00 (Monday) (2026-08-31T06:20:00.000Z).',
+     );
++    expect(result.dynamicToolContextMap?.agent_temporal_instructions).toBeUndefined();
+   });
+ 
+   it('keeps non-temporal special vars in stable instructions', async () => {
+diff --git a/packages/api/src/agents/__tests__/promptPrefixStability.test.ts b/packages/api/src/agents/__tests__/promptPrefixStability.test.ts
+new file mode 100644
+index 000000000..49cbf583f
+--- /dev/null
++++ b/packages/api/src/agents/__tests__/promptPrefixStability.test.ts
+@@ -0,0 +1,624 @@
++/**
++ * Provider payload stability across the turns of a conversation.
++ *
++ * Builds each turn through the real `createRun` and the provider chat model
++ * classes, captures the serialized request right before it would leave the
++ * process, and aborts it there: fetch-based clients (OpenAI and OpenAI-
++ * compatible endpoints, Anthropic, Google) through a mocked global `fetch`,
++ * Bedrock through an injected runtime client whose `send` records the command
++ * input. No request reaches the network.
++ *
++ * Runs with `endpoints.agents.promptCache.stableContext` on, except where a
++ * test says otherwise.
++ *
++ * Covered: OpenAI, an OpenAI-compatible custom endpoint (vLLM), Anthropic with
++ * and without prompt caching, OpenRouter with prompt caching, Bedrock with
++ * prompt caching, and Google. Cache markers move to the newest messages every
++ * turn and are not prompt content, so they are stripped before comparing
++ * histories.
++ *
++ * With Anthropic and OpenRouter prompt caching the SDK moves a non-empty
++ * `additional_instructions` into a message before the newest user message,
++ * and that position shifts every turn. `createRun` merges the conversation-
++ * stable part into `instructions` instead, so the history comparison is strict.
++ * A per-turn part (the volatile parts of the run context: memory and RAG) stays in
++ * `additional_instructions` and is moved on purpose; merging it would change
++ * the system prompt every turn and uncache the whole history.
++ *
++ * The history goes through the same helpers `AgentClient.buildMessages` uses
++ * (`createHistoryContextUpdates`), and the per-chat
++ * system context through the same builders as agent initialization, so a
++ * change to any of them that moves bytes inside a cached prefix fails here.
++ */
++import { tool } from '@langchain/core/tools';
++import { formatAgentMessages, formatMessage, Providers } from '@librechat/agents';
++import { replaceSpecialVars } from 'librechat-data-provider';
++import { buildWebSearchContext, buildWebSearchDynamicContext } from '~/tools/toolkits/web';
++import { createHistoryContextUpdates, AGENT_TEMPORAL_INSTRUCTIONS_KEY } from '../contextUpdates';
++import { createRun } from '../run';
++
++jest.setTimeout(30000);
++
++const TIMEZONE = 'Africa/Nairobi';
++const CAPTURED = 'request captured before network';
++
++interface Conversation {
++  startedAt: string;
++  /** One entry per turn: when the turn started. */
++  turnStarts: string[];
++}
++
++/** A: turns 1 and 2 on Monday evening, turn 3 after local midnight (Nairobi, UTC+3). */
++const CONVERSATION_A: Conversation = {
++  startedAt: '2026-03-09T20:00:00.000Z',
++  turnStarts: ['2026-03-09T20:00:00.000Z', '2026-03-09T20:30:00.000Z', '2026-03-09T21:30:00.000Z'],
++};
++const CONVERSATION_B: Conversation = {
++  startedAt: '2026-04-02T07:15:00.000Z',
++  turnStarts: ['2026-04-02T07:15:00.000Z'],
++};
++
++const lookupTool = tool(async () => 'ok', {
++  name: 'lookup_order',
++  description: 'Looks up an order by its identifier.',
++  schema: {
++    type: 'object',
++    properties: { orderId: { type: 'string', description: 'Order identifier' } },
++    required: ['orderId'],
++  },
++});
++
++const appConfigFor = (stableContext: boolean, includeTimestamps = false) => ({
++  endpoints: {
++    agents: { promptCache: { stableContext }, promptMessageTimestamps: includeTimestamps },
++  },
++});
++
++function buildHistory(
++  conversation: Conversation,
++  turn: number,
++  includeTimestamps: boolean,
++  stableContext: boolean,
++) {
++  const ordered: Array<Record<string, unknown>> = [];
++  for (let i = 0; i < turn; i++) {
++    const isCurrent = i === turn - 1;
++    ordered.push({
++      messageId: `u${i + 1}`,
++      isCreatedByUser: true,
++      sender: 'User',
++      text: `Question ${i + 1}`,
++      /** Stored rows carry the turn start (see `createdAtOnInsert`); the current one is unsaved. */
++      ...(isCurrent ? {} : { createdAt: conversation.turnStarts[i] }),
++    });
++    if (!isCurrent) {
++      ordered.push({
++        messageId: `a${i + 1}`,
++        isCreatedByUser: false,
++        sender: 'Assistant',
++        text: `Answer ${i + 1}`,
++        createdAt: conversation.turnStarts[i],
++      });
++    }
++  }
++  const historyContext = createHistoryContextUpdates({
++    req: {
++      conversationCreatedAt: conversation.startedAt,
++      turnStartedAt: conversation.turnStarts[turn - 1],
++      body: { timezone: TIMEZONE },
++      config: appConfigFor(stableContext, includeTimestamps),
++    },
++    messages: ordered,
++    agents: [{ dynamicToolContextMap: { web_search: 'stated' } }],
++  });
++  const formatted = ordered.map((message, index) => {
++    const formattedMessage = formatMessage({ message: message as never });
++    historyContext.apply(formattedMessage as never, index);
++    return formattedMessage;
++  });
++  return formatAgentMessages(formatted as never, {}).messages;
++}
++
++type ProviderCase = {
++  name: string;
++  provider: string;
++  endpoint?: string;
++  modelParameters: Record<string, unknown>;
++};
++
++type Captured = { system: unknown; tools: unknown; messages: unknown[] };
++
++const RUNTIME_CONTEXT_MARKER = 'Conversation started:';
++const STATIC_ADDITIONAL = 'Answer in the language of the user.';
++const QUEUED_CONTEXT = 'report.csv';
++
++/** Code-env state of a turn whose upload is queued; `createRun` derives the queued file context from it. */
++const queuedFileState = (queued: boolean) => ({
++  fileConsumers: { executeCode: true, fileSearch: false },
++  provisionState: {
++    codeEnvFiles: queued
++      ? [
++          {
++            file_id: 'report',
++            filename: QUEUED_CONTEXT,
++            filepath: '/uploads/report.csv',
++            type: 'text/csv',
++            user: 'user-1',
++            object: 'file',
++            bytes: 10,
++            embedded: false,
++            usage: 0,
++          },
++        ]
++      : [],
++    vectorDBFiles: [],
++    aliveFileIds: new Set(),
++    agentScopedFileIds: new Set(),
++  },
++});
++const memoryFor = (turn: number) =>
++  `Memory after turn ${turn}: prefers metric units, note ${turn * 104729}.`;
++const ragFor = (turn: number) => `Retrieved context for question ${turn}: passage ${turn * 7919}.`;
++
++interface AgentVariant {
++  /** Adds query-dependent RAG context to `additional_instructions`. */
++  rag?: boolean;
++  /** Adds memory context, which the memory agent rewrites between turns. */
++  memory?: boolean;
++  /** Turn after which an upload leaves one-turn queued file context (gone on the next turn). */
++  queuedAtTurn?: number;
++  /** Declares memory and RAG context as per-turn, as `AgentClient` does. */
++  declareVolatile?: boolean;
++  /** Dates the runtime context by the turn start instead of the conversation start. */
++  perTurnClock?: boolean;
++  /** `promptCache.stableContext`; on unless a test says otherwise. */
++  stableContext?: boolean;
++}
++
++function isCachePointBlock(value: unknown): boolean {
++  return (
++    value != null &&
++    typeof value === 'object' &&
++    Object.keys(value).length === 1 &&
++    'cachePoint' in value
++  );
++}
++
++function stripCacheMarkers(value: unknown): unknown {
++  if (Array.isArray(value)) {
++    return value.filter((item) => !isCachePointBlock(item)).map(stripCacheMarkers);
++  }
++  if (value != null && typeof value === 'object') {
++    return Object.fromEntries(
++      Object.entries(value)
++        .filter(([key]) => key !== 'cache_control')
++        .map(([key, nested]) => [key, stripCacheMarkers(nested)]),
++    );
++  }
++  return value;
++}
++
++const serialize = (value: unknown) => JSON.stringify(stripCacheMarkers(value));
++
++async function captureTurn(
++  providerCase: ProviderCase,
++  conversation: Conversation,
++  turn: number,
++  includeTimestamps = false,
++  variant: AgentVariant = {},
++): Promise<Captured> {
++  let captured: Captured | undefined;
++  const stableContext = variant.stableContext ?? true;
++  const now =
++    variant.perTurnClock || !stableContext
++      ? conversation.turnStarts[turn - 1]
++      : conversation.startedAt;
++  const rag = variant.rag ? ragFor(turn) : undefined;
++  const volatile = [variant.memory ? memoryFor(turn) : undefined, rag].filter(Boolean).join('\n\n');
++  const agent = {
++    id: 'agent_stable',
++    name: 'Stable Agent',
++    provider: providerCase.provider,
++    endpoint: providerCase.endpoint ?? providerCase.provider,
++    instructions: 'You are a careful support assistant.',
++    additional_instructions: [STATIC_ADDITIONAL, volatile].filter(Boolean).join('\n\n'),
++    ...(variant.queuedAtTurn ? queuedFileState(variant.queuedAtTurn === turn) : {}),
++    ...(variant.declareVolatile && volatile
++      ? {
++          stable_additional_instructions: STATIC_ADDITIONAL,
++          volatile_instructions: volatile,
++          split_additional_instructions: [STATIC_ADDITIONAL, volatile].join('\n\n'),
++        }
++      : {}),
++    toolContextMap: { web_search: buildWebSearchContext(stableContext) },
++    dynamicToolContextMap: {
++      web_search: buildWebSearchDynamicContext({
++        turnStartedAt: now,
++        conversationStartedAt: now,
++        timezone: TIMEZONE,
++        stableContext,
++      }),
++      [AGENT_TEMPORAL_INSTRUCTIONS_KEY]: replaceSpecialVars({
++        text: 'Today is {{current_date}}.',
++        now,
++        timezone: TIMEZONE,
++      }),
++    },
++    tools: [lookupTool],
++    maxContextTokens: 100000,
++    model_parameters: { ...providerCase.modelParameters },
++  };
++
++  const fetchMock = jest.spyOn(global, 'fetch').mockImplementation(async (input, init) => {
++    const request = input instanceof Request ? input : undefined;
++    const raw = request ? await request.clone().text() : String(init?.body ?? '{}');
++    const body = JSON.parse(raw) as Record<string, unknown>;
++    if (providerCase.provider === Providers.GOOGLE) {
++      captured = {
++        system: body.systemInstruction,
++        tools: body.tools,
++        messages: body.contents as unknown[],
++      };
++    } else if (providerCase.provider === Providers.ANTHROPIC) {
++      captured = { system: body.system, tools: body.tools, messages: body.messages as unknown[] };
++    } else {
++      const messages = body.messages as Array<{ role: string }>;
++      captured = {
++        system: messages.filter((message) => message.role === 'system'),
++        tools: body.tools,
++        messages: messages.filter((message) => message.role !== 'system'),
++      };
++    }
++    throw new Error(CAPTURED);
++  });
++  if (providerCase.provider === Providers.BEDROCK) {
++    agent.model_parameters.client = {
++      send: async (command: { input: Record<string, unknown> }) => {
++        captured = {
++          system: command.input.system,
++          tools: command.input.toolConfig,
++          messages: command.input.messages as unknown[],
++        };
++        throw new Error(CAPTURED);
++      },
++      config: {},
++      destroy: () => undefined,
++      middlewareStack: { add: () => undefined, use: () => undefined },
++    };
++  }
++
++  try {
++    const messages = buildHistory(conversation, turn, includeTimestamps, stableContext);
++    const runId = `stability-${providerCase.name}-${turn}-${Math.random()}`;
++    const run = await createRun({
++      appConfig: appConfigFor(stableContext) as never,
++      agents: [agent] as never,
++      messages,
++      runId,
++      signal: new AbortController().signal,
++      streaming: false,
++      streamUsage: false,
++    });
++    await run
++      .processStream({ messages }, { configurable: { thread_id: runId }, version: 'v2' })
++      .catch(() => undefined);
++  } finally {
++    fetchMock.mockRestore();
++  }
++  if (captured == null) {
++    throw new Error(`No request captured for ${providerCase.name}`);
++  }
++  return captured;
++}
++
++const PROVIDERS: ProviderCase[] = [
++  {
++    name: 'openAI',
++    provider: Providers.OPENAI,
++    modelParameters: { model: 'gpt-4.1', apiKey: 'test-key', maxRetries: 0 },
++  },
++  {
++    name: 'custom OpenAI-compatible (vLLM)',
++    provider: Providers.OPENAI,
++    endpoint: 'vLLM',
++    modelParameters: {
++      model: 'local-model',
++      apiKey: 'test-key',
++      maxRetries: 0,
++      configuration: { baseURL: 'https://vllm.invalid/v1' },
++    },
++  },
++  {
++    name: 'anthropic',
++    provider: Providers.ANTHROPIC,
++    modelParameters: { model: 'claude-sonnet-4-5', apiKey: 'test-key', maxRetries: 0 },
++  },
++  {
++    name: 'anthropic with promptCache',
++    provider: Providers.ANTHROPIC,
++    modelParameters: {
++      model: 'claude-sonnet-4-5',
++      apiKey: 'test-key',
++      maxRetries: 0,
++      promptCache: true,
++    },
++  },
++  {
++    name: 'custom endpoint on the Anthropic protocol with promptCache',
++    provider: Providers.ANTHROPIC,
++    endpoint: 'gateway',
++    modelParameters: {
++      model: 'claude-sonnet-4-5',
++      apiKey: 'test-key',
++      maxRetries: 0,
++      promptCache: true,
++    },
++  },
++  {
++    name: 'openrouter with promptCache',
++    provider: Providers.OPENROUTER,
++    modelParameters: {
++      model: 'anthropic/claude-sonnet-4.5',
++      apiKey: 'test-key',
++      maxRetries: 0,
++      promptCache: true,
++    },
++  },
++  {
++    name: 'bedrock with promptCache',
++    provider: Providers.BEDROCK,
++    modelParameters: {
++      model: 'anthropic.claude-sonnet-4-5-20250929-v1:0',
++      region: 'us-east-1',
++      credentials: { accessKeyId: 'test', secretAccessKey: 'test' },
++      maxRetries: 0,
++      promptCache: true,
++    },
++  },
++  {
++    name: 'google',
++    provider: Providers.GOOGLE,
++    modelParameters: { model: 'gemini-2.5-flash', apiKey: 'test-key', maxRetries: 0 },
++  },
++];
++
++describe('prompt prefix stability', () => {
++  describe.each(PROVIDERS.map((providerCase) => [providerCase.name, providerCase] as const))(
++    '%s',
++    (_name, providerCase) => {
++      let turns: Captured[];
++      let otherConversation: Captured;
++
++      beforeAll(async () => {
++        turns = [];
++        for (let turn = 1; turn <= CONVERSATION_A.turnStarts.length; turn++) {
++          turns.push(await captureTurn(providerCase, CONVERSATION_A, turn));
++        }
++        otherConversation = await captureTurn(providerCase, CONVERSATION_B, 1);
++      });
++
++      it('keeps tools and system identical across the turns of a conversation', () => {
++        for (const turn of turns.slice(1)) {
++          expect(JSON.stringify(turn.tools)).toBe(JSON.stringify(turns[0].tools));
++          expect(JSON.stringify(turn.system)).toBe(JSON.stringify(turns[0].system));
++        }
++        expect(JSON.stringify(turns[0].tools)).toContain('lookup_order');
++        for (const turn of turns) {
++          expect(JSON.stringify(turn.system)).toContain(STATIC_ADDITIONAL);
++          expect(JSON.stringify(turn.messages)).not.toContain(RUNTIME_CONTEXT_MARKER);
++        }
++        expect(JSON.stringify(turns[0])).toContain(
++          `${RUNTIME_CONTEXT_MARKER} 2026-03-09 23:00 +03:00 (Mon)`,
++        );
++      });
++
++      it('starts each turn with the previous turn history, newest user message included', () => {
++        for (let i = 1; i < turns.length; i++) {
++          const previous = turns[i - 1].messages;
++          const next = turns[i].messages.slice(0, previous.length);
++          expect(serialize(next)).toBe(serialize(previous));
++        }
++      });
++
++      it('announces the date change only in the first message after local midnight', () => {
++        const lastUserText = (captured: Captured) =>
++          JSON.stringify(captured.messages[captured.messages.length - 1]);
++        expect(lastUserText(turns[0])).not.toContain('<context_update>');
++        expect(lastUserText(turns[1])).not.toContain('<context_update>');
++        expect(lastUserText(turns[2])).toContain('Current date changed to: 2026-03-10 (Tue)');
++      });
++
++      it('shares tools and the static system prefix with another conversation', () => {
++        expect(JSON.stringify(otherConversation.tools)).toBe(JSON.stringify(turns[0].tools));
++        const system = JSON.stringify(turns[0].system);
++        const otherSystem = JSON.stringify(otherConversation.system);
++        const runtimeContextIndex = system.indexOf(RUNTIME_CONTEXT_MARKER);
++        if (runtimeContextIndex < 0) {
++          /** The per-chat tail travels in the history; the whole system block is shared. */
++          expect(otherSystem).toBe(system);
++          return;
++        }
++        expect(otherSystem).not.toBe(system);
++        expect(otherSystem.slice(0, runtimeContextIndex)).toBe(
++          system.slice(0, runtimeContextIndex),
++        );
++      });
++    },
++  );
++
++  it('renders send-time stamps identically on the turn and on later turns', async () => {
++    const [openAI] = PROVIDERS;
++    const turns: Captured[] = [];
++    for (let turn = 1; turn <= CONVERSATION_A.turnStarts.length; turn++) {
++      turns.push(await captureTurn(openAI, CONVERSATION_A, turn, true));
++    }
++    for (let i = 1; i < turns.length; i++) {
++      const previous = turns[i - 1].messages;
++      expect(JSON.stringify(turns[i].messages.slice(0, previous.length))).toBe(
++        JSON.stringify(previous),
++      );
++    }
++    expect(JSON.stringify(turns[2].messages)).toContain(
++      'Message sent: 2026-03-09 23:30:00 +03:00 (Mon)',
++    );
++    expect(JSON.stringify(turns[2].messages[4])).toContain(
++      'Current date changed to: 2026-03-10 (Tue)\\nMessage sent: 2026-03-10 00:30:00 +03:00 (Tue)',
++    );
++  });
++});
++
++const MOVES_TAIL = PROVIDERS.filter(
++  ({ name }) =>
++    name.includes('anthropic with') ||
++    name.includes('openrouter with') ||
++    name.includes('Anthropic protocol'),
++);
++
++async function playConversation(providerCase: ProviderCase, variant: AgentVariant) {
++  const turns: Captured[] = [];
++  for (let turn = 1; turn <= CONVERSATION_A.turnStarts.length; turn++) {
++    turns.push(await captureTurn(providerCase, CONVERSATION_A, turn, false, variant));
++  }
++  return turns;
++}
++
++/** Texts that change from turn to turn without a user action. */
++const perTurn = (index: number) => [memoryFor(index + 1), ragFor(index + 1)];
++
++const roleOf = (message: unknown) => (message as { role?: string }).role;
++
++describe('per-turn context in additional_instructions', () => {
++  describe.each(PROVIDERS.map((providerCase) => [providerCase.name, providerCase] as const))(
++    '%s',
++    (_name, providerCase) => {
++      const movesTail = MOVES_TAIL.includes(providerCase);
++      let turns: Captured[];
++
++      beforeAll(async () => {
++        turns = await playConversation(providerCase, {
++          rag: true,
++          memory: true,
++          declareVolatile: true,
++        });
++      });
++
++      it('sends every turn its own memory and RAG context and keeps tools identical', () => {
++        turns.forEach((turn, index) => {
++          expect(JSON.stringify(turn.tools)).toBe(JSON.stringify(turns[0].tools));
++          for (const text of perTurn(index)) {
++            expect(JSON.stringify([turn.system, turn.messages])).toContain(text);
++          }
++        });
++      });
++
++      if (!movesTail) {
++        it('keeps the memory and RAG context in the system prompt', () => {
++          turns.forEach((turn, index) => {
++            for (const text of perTurn(index)) {
++              expect(JSON.stringify(turn.system)).toContain(text);
++              expect(JSON.stringify(turn.messages)).not.toContain(text);
++            }
++          });
++        });
++        return;
++      }
++
++      const carrierIndexes = (turn: Captured, index: number) =>
++        turn.messages.flatMap((message, position) =>
++          perTurn(index).every((text) => JSON.stringify(message).includes(text)) ? [position] : [],
++        );
++
++      it('keeps the system prompt byte-identical, without the memory and RAG context', () => {
++        turns.forEach((turn, index) => {
++          expect(JSON.stringify(turn.system)).toBe(JSON.stringify(turns[0].system));
++          expect(JSON.stringify(turn.system)).toContain(RUNTIME_CONTEXT_MARKER);
++          for (const text of perTurn(index)) {
++            expect(JSON.stringify(turn.system)).not.toContain(text);
++          }
++        });
++      });
++
++      it('moves only the memory and RAG context, in one message next to the newest user message', () => {
++        turns.forEach((turn, index) => {
++          /** The SDK places the tail after the only message of a one-message OpenRouter request. */
++          const alone = index === 0 && providerCase.provider === Providers.OPENROUTER;
++          const expected = alone ? turn.messages.length - 1 : turn.messages.length - 2;
++          expect(carrierIndexes(turn, index)).toEqual([expected]);
++          expect(JSON.stringify(turn.messages)).not.toContain(STATIC_ADDITIONAL);
++          expect(roleOf(turn.messages[turn.messages.length - 1])).toBe('user');
++        });
++      });
++
++      it('reuses everything before the moved tail on the next turn', () => {
++        for (let i = 1; i < turns.length; i++) {
++          const previous = turns[i - 1].messages;
++          const reusable = previous.slice(0, carrierIndexes(turns[i - 1], i - 1)[0]);
++          if (i >= 2) {
++            expect(reusable.length).toBeGreaterThan(0);
++          }
++          expect(serialize(turns[i].messages.slice(0, reusable.length))).toBe(serialize(reusable));
++          for (const text of perTurn(i - 1)) {
++            expect(JSON.stringify(turns[i].messages)).not.toContain(text);
++          }
++        }
++      });
++    },
++  );
++
++  describe.each(MOVES_TAIL.map((providerCase) => [providerCase.name, providerCase] as const))(
++    '%s: regression guard',
++    (_name, providerCase) => {
++      it('a per-turn part merged into the stable instructions changes the system prompt every turn', async () => {
++        /** No `volatile_instructions`: memory and RAG context cannot be told apart and are merged. */
++        const turns = await playConversation(providerCase, { rag: true, memory: true });
++        expect(JSON.stringify(turns[1].system)).not.toBe(JSON.stringify(turns[0].system));
++        expect(JSON.stringify(turns[2].system)).not.toBe(JSON.stringify(turns[1].system));
++      });
++
++      it('a runtime context dated by the turn start changes the system prompt every turn', async () => {
++        const turns = await playConversation(providerCase, { perTurnClock: true });
++        expect(JSON.stringify(turns[1].system)).not.toBe(JSON.stringify(turns[0].system));
++        expect(JSON.stringify(turns[2].system)).not.toBe(JSON.stringify(turns[1].system));
++      });
++    },
++  );
++
++  describe.each(MOVES_TAIL.map((providerCase) => [providerCase.name, providerCase] as const))(
++    '%s: one-turn queued file context',
++    (_name, providerCase) => {
++      it('keeps system byte-identical when queued files appear on one turn and are gone on the next', async () => {
++        const turns = await playConversation(providerCase, { queuedAtTurn: 2 });
++        expect(JSON.stringify(turns[1].system)).toBe(JSON.stringify(turns[0].system));
++        expect(JSON.stringify(turns[2].system)).toBe(JSON.stringify(turns[0].system));
++        expect(JSON.stringify(turns[1].system)).not.toContain(QUEUED_CONTEXT);
++        expect(JSON.stringify(turns[1].messages)).toContain(QUEUED_CONTEXT);
++        expect(JSON.stringify(turns[0].messages)).not.toContain(QUEUED_CONTEXT);
++        expect(JSON.stringify(turns[2].messages)).not.toContain(QUEUED_CONTEXT);
++      });
++    },
++  );
++});
++
++describe('stableContext off', () => {
++  describe.each(PROVIDERS.map((providerCase) => [providerCase.name, providerCase] as const))(
++    '%s',
++    (_name, providerCase) => {
++      it('dates the runtime context by each turn and announces nothing in the history', async () => {
++        const turns = await playConversation(providerCase, { stableContext: false });
++        for (const turn of turns) {
++          const request = JSON.stringify([turn.system, turn.messages]);
++          expect(request).toContain('Conversation Date & Time:');
++          expect(request).not.toContain(RUNTIME_CONTEXT_MARKER);
++          expect(JSON.stringify(turn.messages)).not.toContain('<context_update>');
++        }
++        const stamps = turns.map(
++          (turn) =>
++            /Conversation Date & Time: ([^"\\]+)/.exec(
++              JSON.stringify([turn.system, turn.messages]),
++            )?.[1],
++        );
++        expect(new Set(stamps).size).toBe(turns.length);
++      });
++    },
++  );
++});
+diff --git a/packages/api/src/agents/__tests__/run-summarization.test.ts b/packages/api/src/agents/__tests__/run-summarization.test.ts
+index 4115928e0..538473f0d 100644
+--- a/packages/api/src/agents/__tests__/run-summarization.test.ts
++++ b/packages/api/src/agents/__tests__/run-summarization.test.ts
+@@ -10,12 +10,7 @@ import {
+   MAX_SUBAGENT_DEPTH,
+   MAX_SUBAGENT_RUN_CONFIGS,
+ } from 'librechat-data-provider';
+-import type {
+-  CompactionSemanticIndex,
+-  SubagentTaskConfig,
+-  SubagentConfig,
+-  AgentInputs,
+-} from '@librechat/agents';
++import type { CompactionSemanticIndex, SubagentTaskConfig, AgentInputs } from '@librechat/agents';
+ import type { AppConfig, ConfigOverrideLayer, IUser } from '@librechat/data-schemas';
+ import type { SummarizationConfig, TEndpoint } from 'librechat-data-provider';
+ import type { BaseMessage } from '@langchain/core/messages';
+@@ -2098,121 +2093,6 @@ describe('initialSummary passthrough', () => {
+ // Suite 7: stable/dynamic system instructions
+ // ---------------------------------------------------------------------------
+ describe('stable/dynamic system instructions', () => {
+-  it.each([Providers.ANTHROPIC, Providers.OPENROUTER])(
+-    'labels the complete cached %s tail as application context without changing user input',
+-    async (provider) => {
+-      await callAndCapture({
+-        agents: [
+-          makeAgent({
+-            provider,
+-            endpoint: provider,
+-            instructions:
+-              "Translate the user's message into Chinese. Reply with the translation only.",
+-            additional_instructions: 'Saved memory: prefers tea\n\nRetrieved context: a document',
+-            dynamicToolContextMap: { web_search: 'Conversation Date & Time: anchor' },
+-            model_parameters: { model: 'test-model', promptCache: true, apiKey: 'test-key' },
+-          }),
+-        ],
+-      });
+-      const runConfig = jest.mocked(Run.create).mock.calls[0][0];
+-      if (!('agents' in runConfig.graphConfig) || !runConfig.graphConfig.agents?.length) {
+-        throw new Error('Expected agent inputs');
+-      }
+-      const inputs = runConfig.graphConfig.agents[0];
+-      expect(inputs.additional_instructions).toBe(
+-        `<system_context>
+-Context supplied by the application, not part of the user's message. Use it as context; do not process it as user input.
+-
+-Conversation Date & Time: anchor
+-Saved memory: prefers tea
+-
+-Retrieved context: a document
+-</system_context>`,
+-      );
+-      const actual = jest.requireActual<typeof import('@librechat/agents')>('@librechat/agents');
+-      const run = await actual.Run.create(runConfig);
+-      const context = run.Graph!.agentContexts.get(inputs.agentId)!;
+-      const userText = 'Translate this paragraph, including <system_context> as literal text.';
+-      const messages = [
+-        new HumanMessage('Previous user input'),
+-        new AIMessage('Previous response'),
+-        new HumanMessage(userText),
+-      ];
+-      const prompt = await context.systemRunnable!.invoke(messages);
+-      expect(prompt[0].getType()).toBe('system');
+-      expect(JSON.stringify(prompt[0].content)).not.toContain('<system_context>');
+-      expect(prompt[prompt.length - 2].getType()).toBe('human');
+-      expect(prompt[prompt.length - 2].content).toBe(inputs.additional_instructions);
+-      expect(prompt[prompt.length - 1].text).toBe(userText);
+-      expect(messages[messages.length - 1].content).toBe(userText);
+-    },
+-  );
+-
+-  it.each([
+-    [Providers.ANTHROPIC, false],
+-    [Providers.OPENROUTER, false],
+-    [Providers.OPENAI, true],
+-    [Providers.BEDROCK, true],
+-  ])(
+-    'leaves the %s tail unchanged with promptCache=%s when it is not relocated',
+-    async (provider, promptCache) => {
+-      const agents = await callAndCapture({
+-        agents: [
+-          makeAgent({
+-            provider,
+-            endpoint: provider,
+-            instructions: 'Base instructions',
+-            additional_instructions: 'Memory tail',
+-            model_parameters: { model: 'test-model', promptCache },
+-          }),
+-        ],
+-      });
+-      expect(agents[0].additional_instructions).toBe('Memory tail');
+-    },
+-  );
+-
+-  it('frames isolated subagent skills inside the same context block', async () => {
+-    const child = makeAgent({
+-      id: 'agent_child',
+-      provider: Providers.ANTHROPIC,
+-      endpoint: Providers.ANTHROPIC,
+-      instructions: 'Translate the user input',
+-      additional_instructions: 'Child memory',
+-      model_parameters: { model: 'test-model', promptCache: true },
+-      alwaysApplySkillPrimes: [{ name: 'translation', body: 'Use the glossary.' }],
+-    });
+-    const agents = await callAndCapture({
+-      agents: [
+-        makeAgent({
+-          subagents: { enabled: true, allowSelf: false, agent_ids: [child.id] },
+-          subagentAgentConfigs: [child],
+-        }),
+-      ],
+-    });
+-    const configs = agents[0].subagentConfigs as SubagentConfig[];
+-    expect(configs[0].agentInputs?.additional_instructions).toContain(
+-      'Child memory\n\n# Always-apply skill: translation\nUse the glossary.\n</system_context>',
+-    );
+-    expect(
+-      configs[0].agentInputs?.additional_instructions?.match(/<system_context>/g),
+-    ).toHaveLength(1);
+-    expect(child.additional_instructions).toBe('Child memory');
+-  });
+-
+-  it('does not add a context carrier for an empty cached tail', async () => {
+-    const agents = await callAndCapture({
+-      agents: [
+-        makeAgent({
+-          provider: Providers.ANTHROPIC,
+-          endpoint: Providers.ANTHROPIC,
+-          instructions: 'Translate the user input',
+-          model_parameters: { model: 'test-model', promptCache: true },
+-        }),
+-      ],
+-    });
+-    expect(agents[0].additional_instructions).toBeUndefined();
+-  });
+-
+   it('keeps static tool and agent instructions separate from dynamic runtime tail', async () => {
+     const agents = await callAndCapture({
+       agents: [
+@@ -2229,76 +2109,47 @@ Retrieved context: a document
+     expect(agents[0].additional_instructions).toBe('Conversation Date & Time: anchor\nMemory tail');
+   });
+ 
+-  it('hands the SDK the same system prompt as upstream without stableContext', async () => {
++  it('puts dynamic tool context after the additional instructions with stableContext', async () => {
+     const agents = await callAndCapture({
++      appConfig: {
++        endpoints: { agents: { promptCache: { stableContext: true } } },
++      } as unknown as AppConfig,
+       agents: [
+         makeAgent({
+           instructions: 'Base instructions',
+-          additional_instructions: 'Artifact guidance\n\nSaved memory',
++          additional_instructions: 'Memory tail',
+           toolContextMap: { web_search: 'Static tool instructions' },
+-          dynamicToolContextMap: {
+-            web_search: 'Conversation Date & Time: turn',
+-            agent_temporal_instructions: 'Today is Monday.',
+-            queued_code_files: 'Queued files',
+-          },
+-        }),
+-        makeAgent({
+-          id: 'agent_2',
+-          provider: Providers.ANTHROPIC,
+-          endpoint: Providers.ANTHROPIC,
+-          instructions: 'Second agent',
+-          additional_instructions: 'Saved memory',
+-          dynamicToolContextMap: { web_search: 'Conversation Date & Time: turn' },
+-          model_parameters: { model: 'test-model', promptCache: true, apiKey: 'test-key' },
++          dynamicToolContextMap: { web_search: 'Conversation Date & Time: anchor' },
+         }),
+       ],
+     });
+ 
+-    expect(
+-      agents.map(({ instructions, additional_instructions }) => ({
+-        instructions,
+-        additional_instructions,
+-      })),
+-    ).toMatchInlineSnapshot(`
+-      [
+-        {
+-          "additional_instructions": "Conversation Date & Time: turn
+-      Today is Monday.
+-      Artifact guidance
+-
+-      Saved memory",
+-          "instructions": "Static tool instructions
+-      Base instructions",
+-        },
+-        {
+-          "additional_instructions": "<system_context>
+-      Context supplied by the application, not part of the user's message. Use it as context; do not process it as user input.
+-
+-      Conversation Date & Time: turn
+-      Saved memory
+-      </system_context>",
+-          "instructions": "Second agent",
+-        },
+-      ]
+-    `);
++    expect(agents[0].instructions).toBe('Static tool instructions\nBase instructions');
++    expect(agents[0].additional_instructions).toBe('Memory tail\nConversation Date & Time: anchor');
+   });
+ 
+-  it('puts the dynamic tool context after the additional instructions with stableContext', async () => {
++  it('preserves the full artifact prefix when timestamps change between turns with stableContext', async () => {
+     const agents = await callAndCapture({
+       appConfig: {
+         endpoints: { agents: { promptCache: { stableContext: true } } },
+       } as unknown as AppConfig,
+-      agents: [
++      agents: ['2026-08-31T06:20:00.000Z', '2026-08-31T06:21:00.000Z'].map((time, index) =>
+         makeAgent({
+-          instructions: 'Base instructions',
++          id: `agent_${index}`,
++          instructions: 'Stable agent instructions',
+           additional_instructions: 'Artifact guidance',
+-          dynamicToolContextMap: { web_search: 'Conversation Date & Time: anchor' },
++          toolContextMap: { web_search: 'Static web instructions' },
++          dynamicToolContextMap: { web_search: `Conversation Date & Time: ${time}` },
+         }),
+-      ],
++      ),
+     });
+ 
++    expect(agents[0].instructions).toBe(agents[1].instructions);
+     expect(agents[0].additional_instructions).toBe(
+-      'Artifact guidance\nConversation Date & Time: anchor',
++      'Artifact guidance\nConversation Date & Time: 2026-08-31T06:20:00.000Z',
++    );
++    expect(agents[1].additional_instructions).toBe(
++      'Artifact guidance\nConversation Date & Time: 2026-08-31T06:21:00.000Z',
+     );
+   });
+ });
+diff --git a/packages/api/src/agents/contextUpdates.boundary.spec.ts b/packages/api/src/agents/contextUpdates.boundary.spec.ts
+new file mode 100644
+index 000000000..6ab91a4c4
+--- /dev/null
++++ b/packages/api/src/agents/contextUpdates.boundary.spec.ts
+@@ -0,0 +1,93 @@
++import { ContentTypes } from 'librechat-data-provider';
++import { formatAgentMessages, formatMessage } from '@librechat/agents';
++import { findSummaryBoundaryIndex } from './contextUpdates';
++
++type Row = {
++  messageId: string;
++  isCreatedByUser: boolean;
++  sender: string;
++  text: string;
++  content?: unknown[];
++};
++
++const user = (n: number): Row => ({
++  messageId: `u${n}`,
++  isCreatedByUser: true,
++  sender: 'User',
++  text: `question-${n}`,
++});
++
++const assistant = (n: number, summary?: { retainedFromMessageId?: string }): Row => ({
++  messageId: `a${n}`,
++  isCreatedByUser: false,
++  sender: 'Assistant',
++  text: `answer-${n}`,
++  content: [
++    ...(summary
++      ? [
++          {
++            type: ContentTypes.SUMMARY,
++            content: [{ type: ContentTypes.TEXT, text: 'Earlier discussion.' }],
++            boundary: { messageId: `a${n}`, contentIndex: 0 },
++            ...(summary.retainedFromMessageId ? { coverage: summary } : {}),
++          },
++        ]
++      : []),
++    { type: ContentTypes.TEXT, text: `answer-${n}` },
++  ],
++});
++
++/** The user questions the SDK formatter keeps in the prompt, in order. */
++function visibleQuestions(rows: Row[]): string[] {
++  /** The formatter resolves `coverage` through the source message ids, which the payload keeps. */
++  const formatted = rows.map((message) => ({
++    ...formatMessage({ message: message as never }),
++    messageId: message.messageId,
++  }));
++  const { messages } = formatAgentMessages(formatted as never, {});
++  return messages
++    .filter((message) => message.getType() === 'human')
++    .map((message) => JSON.stringify(message.content))
++    .flatMap((text) => text.match(/question-\d+/g) ?? []);
++}
++
++const questionsFrom = (rows: Row[], index: number) =>
++  rows
++    .slice(index)
++    .filter((row) => row.isCreatedByUser)
++    .map((row) => row.text);
++
++/**
++ * `findSummaryBoundaryIndex` mirrors the SDK formatter's summary boundary. If the formatter
++ * changes where it cuts the history, these cases fail and the predicate must follow.
++ */
++describe('findSummaryBoundaryIndex against the SDK formatter', () => {
++  const cases: Array<[string, Row[]]> = [
++    ['no summary', [user(1), assistant(1), user(2), assistant(2), user(3)]],
++    [
++      'summary on an earlier answer keeps history from that answer',
++      [user(1), assistant(1, {}), user(2), assistant(2), user(3)],
++    ],
++    [
++      'latest of two summaries wins',
++      [user(1), assistant(1, {}), user(2), assistant(2, {}), user(3)],
++    ],
++    [
++      'coverage names an earlier retained user message',
++      [user(1), assistant(1), user(2), assistant(2, { retainedFromMessageId: 'u2' }), user(3)],
++    ],
++    [
++      'coverage names a later message than the carrier',
++      [user(1), assistant(1, { retainedFromMessageId: 'u2' }), user(2), assistant(2), user(3)],
++    ],
++  ];
++
++  it.each(cases)('%s', (_name, rows) => {
++    const boundary = findSummaryBoundaryIndex(rows);
++    const visible = visibleQuestions(rows);
++    const expected = questionsFrom(rows, boundary);
++    /** The formatter may reopen the history with the carrier's own question; never with older ones. */
++    expect(visible.slice(-expected.length)).toEqual(expected);
++    expect(visible.length - expected.length).toBeLessThanOrEqual(0);
++  });
++});
+diff --git a/packages/api/src/agents/contextUpdates.spec.ts b/packages/api/src/agents/contextUpdates.spec.ts
+new file mode 100644
+index 000000000..b8335a66c
+--- /dev/null
++++ b/packages/api/src/agents/contextUpdates.spec.ts
+@@ -0,0 +1,325 @@
++import { ContentTypes } from 'librechat-data-provider';
++import {
++  formatContextUpdate,
++  findSummaryBoundaryIndex,
++  hasConversationDateContext,
++  buildUserMessageContextUpdates,
++  getTurnUserMessageCreatedAt,
++  createHistoryContextUpdates,
++} from './contextUpdates';
++import type { ContextUpdateMessage } from './contextUpdates';
++
++const user = (messageId: string, createdAt?: string): ContextUpdateMessage => ({
++  messageId,
++  isCreatedByUser: true,
++  createdAt,
++});
++const assistant = (
++  messageId: string,
++  createdAt: string,
++  content?: unknown[],
++): ContextUpdateMessage => ({ messageId, isCreatedByUser: false, createdAt, content });
++
++const summaryPart = (coverage?: { retainedFromMessageId?: string }) => ({
++  type: ContentTypes.SUMMARY,
++  content: [{ type: ContentTypes.TEXT, text: 'Earlier discussion.' }],
++  boundary: { messageId: 'm', contentIndex: 0 },
++  ...(coverage ? { coverage } : {}),
++});
++
++/** 23:00 on Monday 2026-03-09 in Nairobi (UTC+3). */
++const START = '2026-03-09T20:00:00.000Z';
++
++describe('formatContextUpdate', () => {
++  it('wraps lines in a context_update block', () => {
++    expect(formatContextUpdate(['a', 'b'])).toBe('<context_update>\na\nb\n</context_update>');
++  });
++});
++
++describe('findSummaryBoundaryIndex', () => {
++  it('is 0 without a summary', () => {
++    expect(findSummaryBoundaryIndex([user('u1'), assistant('a1', START)])).toBe(0);
++  });
++
++  it('keeps history from the message carrying the latest usable summary', () => {
++    const messages = [
++      user('u1'),
++      assistant('a1', START, [summaryPart()]),
++      user('u2'),
++      assistant('a2', START, [summaryPart()]),
++      user('u3'),
++    ];
++    expect(findSummaryBoundaryIndex(messages)).toBe(3);
++  });
++
++  it('keeps history from the covered message in coverage mode', () => {
++    const messages = [
++      user('u1'),
++      assistant('a1', START),
++      user('u2'),
++      assistant('a2', START, [summaryPart({ retainedFromMessageId: 'u2' })]),
++    ];
++    expect(findSummaryBoundaryIndex(messages)).toBe(2);
++  });
++
++  it('falls back to the carrying message when coverage names an unknown or later message', () => {
++    const messages = [
++      user('u1'),
++      assistant('a1', START, [summaryPart({ retainedFromMessageId: 'u2' })]),
++      user('u2'),
++    ];
++    expect(findSummaryBoundaryIndex(messages)).toBe(1);
++  });
++
++  it('ignores summaries that failed or never finished', () => {
++    const messages = [
++      user('u1'),
++      assistant('a1', START, [{ ...summaryPart(), failed: true }]),
++      assistant('a2', START, [{ ...summaryPart(), boundary: undefined }]),
++    ];
++    expect(findSummaryBoundaryIndex(messages)).toBe(0);
++  });
++});
++
++describe('buildUserMessageContextUpdates', () => {
++  const base = {
++    conversationStartedAt: START,
++    timezone: 'Africa/Nairobi',
++    trackDateChanges: true,
++    includeTimestamps: false,
++  };
++
++  it('adds nothing while the local date matches the conversation start', () => {
++    const updates = buildUserMessageContextUpdates({
++      ...base,
++      messages: [user('u1', START), assistant('a1', START), user('u2')],
++      currentTurnStartedAt: '2026-03-09T20:59:00.000Z',
++    });
++    expect(updates.size).toBe(0);
++  });
++
++  it('announces a date change once, on the first message after local midnight', () => {
++    const messages = [
++      user('u1', START),
++      assistant('a1', '2026-03-09T20:00:10.000Z'),
++      /** 00:30 in Nairobi (UTC+3) — the next local day. */
++      user('u2', '2026-03-09T21:30:00.000Z'),
++      assistant('a2', '2026-03-09T21:30:10.000Z'),
++      user('u3'),
++    ];
++    const updates = buildUserMessageContextUpdates({
++      ...base,
++      messages,
++      currentTurnStartedAt: '2026-03-09T22:00:00.000Z',
++    });
++    expect([...updates.entries()]).toEqual([
++      [2, '<context_update>\nCurrent date changed to: 2026-03-10 (Tue)\n</context_update>'],
++    ]);
++  });
++
++  it('dates the newest unsaved message by the current turn start', () => {
++    const updates = buildUserMessageContextUpdates({
++      ...base,
++      messages: [user('u1', START), assistant('a1', START), user('u2')],
++      currentTurnStartedAt: '2026-03-11T08:00:00.000Z',
++    });
++    expect(updates.get(2)).toBe(
++      '<context_update>\nCurrent date changed to: 2026-03-11 (Wed)\n</context_update>',
++    );
++  });
++
++  it('evaluates the local date in the user timezone', () => {
++    const messages = [user('u1', START), assistant('a1', START), user('u2')];
++    const currentTurnStartedAt = '2026-03-09T23:00:00.000Z';
++    expect(buildUserMessageContextUpdates({ ...base, messages, currentTurnStartedAt }).size).toBe(
++      1,
++    );
++    expect(
++      buildUserMessageContextUpdates({
++        ...base,
++        timezone: 'America/New_York',
++        messages,
++        currentTurnStartedAt,
++      }).size,
++    ).toBe(0);
++  });
++
++  it('skips messages a summary replaced and compares against the conversation start', () => {
++    const messages = [
++      user('u1', START),
++      assistant('a1', START),
++      user('u2', '2026-03-12T09:00:00.000Z'),
++      assistant('a2', '2026-03-12T09:00:10.000Z', [summaryPart()]),
++      user('u3', '2026-03-12T10:00:00.000Z'),
++      assistant('a3', '2026-03-12T10:00:10.000Z'),
++      user('u4'),
++    ];
++    const updates = buildUserMessageContextUpdates({
++      ...base,
++      messages,
++      currentTurnStartedAt: '2026-03-12T11:00:00.000Z',
++    });
++    expect([...updates.keys()]).toEqual([4]);
++    expect(updates.get(4)).toContain('Current date changed to: 2026-03-12 (Thu)');
++  });
++
++  it('stamps every visible user message with its send time when timestamps are enabled', () => {
++    const messages = [
++      user('u1', START),
++      assistant('a1', START),
++      user('u2', '2026-03-09T21:30:05.000Z'),
++      assistant('a2', START),
++      user('u3'),
++    ];
++    const updates = buildUserMessageContextUpdates({
++      ...base,
++      includeTimestamps: true,
++      messages,
++      currentTurnStartedAt: '2026-03-09T21:45:07.000Z',
++    });
++    expect([...updates.entries()]).toEqual([
++      [0, '<context_update>\nMessage sent: 2026-03-09 23:00:00 +03:00 (Mon)\n</context_update>'],
++      [
++        2,
++        '<context_update>\nCurrent date changed to: 2026-03-10 (Tue)\nMessage sent: 2026-03-10 00:30:05 +03:00 (Tue)\n</context_update>',
++      ],
++      [4, '<context_update>\nMessage sent: 2026-03-10 00:45:07 +03:00 (Tue)\n</context_update>'],
++    ]);
++  });
++
++  it('only stamps send times when the date is not tracked', () => {
++    const updates = buildUserMessageContextUpdates({
++      ...base,
++      trackDateChanges: false,
++      includeTimestamps: true,
++      messages: [user('u1', '2026-03-15T09:00:00.000Z')],
++    });
++    expect(updates.get(0)).toBe(
++      '<context_update>\nMessage sent: 2026-03-15 12:00:00 +03:00 (Sun)\n</context_update>',
++    );
++  });
++
++  it('returns nothing when both features are off', () => {
++    const updates = buildUserMessageContextUpdates({
++      ...base,
++      trackDateChanges: false,
++      messages: [user('u1', '2026-04-01T00:00:00.000Z')],
++    });
++    expect(updates.size).toBe(0);
++  });
++
++  it('renders history identically on a later turn', () => {
++    const turn2 = [user('u1', START), assistant('a1', START), user('u2')];
++    const first = buildUserMessageContextUpdates({
++      ...base,
++      includeTimestamps: true,
++      messages: turn2,
++      currentTurnStartedAt: '2026-03-10T08:00:00.000Z',
++    });
++    const turn3 = [
++      user('u1', START),
++      assistant('a1', START),
++      user('u2', '2026-03-10T08:00:00.000Z'),
++      assistant('a2', '2026-03-10T08:00:30.000Z'),
++      user('u3'),
++    ];
++    const second = buildUserMessageContextUpdates({
++      ...base,
++      includeTimestamps: true,
++      messages: turn3,
++      currentTurnStartedAt: '2026-03-10T09:00:00.000Z',
++    });
++    expect(second.get(0)).toBe(first.get(0));
++    expect(second.get(2)).toBe(first.get(2));
++  });
++});
++
++describe('hasConversationDateContext', () => {
++  it('detects the web search runtime context or temporal instructions', () => {
++    expect(hasConversationDateContext([{ dynamicToolContextMap: { web_search: 'x' } }])).toBe(true);
++    expect(
++      hasConversationDateContext([
++        {},
++        { dynamicToolContextMap: { agent_temporal_instructions: 'Today is ...' } },
++      ]),
++    ).toBe(true);
++    expect(hasConversationDateContext([null, { dynamicToolContextMap: { other: 'x' } }])).toBe(
++      false,
++    );
++  });
++});
++
++const STABLE_CONFIG = { endpoints: { agents: { promptCache: { stableContext: true } } } };
++const TIMESTAMPS_CONFIG = { endpoints: { agents: { promptMessageTimestamps: true } } };
++
++describe('getTurnUserMessageCreatedAt', () => {
++  const turnStartedAt = Date.parse('2026-10-14T13:41:07.250Z');
++
++  it.each([
++    ['stableContext', STABLE_CONFIG],
++    ['promptMessageTimestamps', TIMESTAMPS_CONFIG],
++  ])('dates the stored user message by the turn start with %s', (_name, config) => {
++    expect(getTurnUserMessageCreatedAt({ turnStartedAt, config })).toEqual(new Date(turnStartedAt));
++  });
++
++  it('leaves the storage timestamp when neither feature that reads it is on', () => {
++    expect(getTurnUserMessageCreatedAt({ turnStartedAt })).toBeUndefined();
++    expect(getTurnUserMessageCreatedAt({ turnStartedAt, config: {} })).toBeUndefined();
++  });
++
++  it('leaves the storage timestamp when the turn start is unknown', () => {
++    expect(getTurnUserMessageCreatedAt(undefined)).toBeUndefined();
++    expect(getTurnUserMessageCreatedAt({ config: STABLE_CONFIG })).toBeUndefined();
++    expect(
++      getTurnUserMessageCreatedAt({ turnStartedAt: Number.NaN, config: STABLE_CONFIG }),
++    ).toBeUndefined();
++  });
++});
++
++describe('createHistoryContextUpdates', () => {
++  const AGENT_WITH_DATE = { dynamicToolContextMap: { web_search: 'stated' } };
++  const messages = [
++    user('u1', START),
++    assistant('a1', START),
++    user('u2', '2026-03-10T10:00:00.000Z'),
++  ];
++  const run = (config: object, agents: object[] = [AGENT_WITH_DATE]) => {
++    const history = createHistoryContextUpdates({
++      req: {
++        conversationCreatedAt: START,
++        turnStartedAt: '2026-03-10T10:00:00.000Z',
++        body: { timezone: 'Africa/Nairobi' },
++        config,
++      },
++      messages,
++      agents,
++    });
++    const formatted = messages.map(() => ({ content: 'text' }));
++    const applied = formatted.map((message, index) => history.apply(message as never, index));
++    return { history, formatted, applied };
++  };
++
++  it('prepends the date-change note to the prompt copy with stableContext', () => {
++    const { history, formatted, applied } = run(STABLE_CONFIG);
++    expect(history.hasUpdates).toBe(true);
++    expect(applied[2]).toContain('Current date changed to: 2026-03-10 (Tue)');
++    expect(formatted[2].content).toContain(applied[2] as string);
++    expect(formatted[0].content).toBe('text');
++  });
++
++  it('announces nothing without stableContext, so the history is as stored', () => {
++    const { history, formatted } = run({});
++    expect(history.hasUpdates).toBe(false);
++    expect(formatted.every((message) => message.content === 'text')).toBe(true);
++  });
++
++  it('announces nothing when no agent states the conversation date', () => {
++    expect(run(STABLE_CONFIG, [{}]).history.hasUpdates).toBe(false);
++  });
++
++  it('stamps send times only with promptMessageTimestamps', () => {
++    const { applied } = run(TIMESTAMPS_CONFIG);
++    expect(applied[0]).toContain('Message sent: 2026-03-09 23:00:00 +03:00 (Mon)');
++    expect(applied[2]).not.toContain('Current date changed');
++  });
++});
+diff --git a/packages/api/src/agents/instructionPlan.spec.ts b/packages/api/src/agents/instructionPlan.spec.ts
+new file mode 100644
+index 000000000..8bc75252c
+--- /dev/null
++++ b/packages/api/src/agents/instructionPlan.spec.ts
+@@ -0,0 +1,131 @@
++import { Providers } from '@librechat/agents';
++import {
++  planInstructions,
++  buildAdditionalInstructions,
++  sdkMovesDynamicInstructions,
++} from './instructionPlan';
++
++describe('buildAdditionalInstructions', () => {
++  it('places dynamic tool context after static additional instructions', () => {
++    const result = buildAdditionalInstructions(
++      'Artifacts prompt',
++      'Conversation Date & Time: 2025-01-01T00:00:00.000Z',
++    );
++
++    expect(result).toBe('Artifacts prompt\nConversation Date & Time: 2025-01-01T00:00:00.000Z');
++  });
++
++  it('keeps the static prefix identical when only the dynamic context changes', () => {
++    const first = buildAdditionalInstructions('Artifacts prompt', 'Time: 1');
++    const second = buildAdditionalInstructions('Artifacts prompt', 'Time: 2');
++
++    expect(first.startsWith('Artifacts prompt\n')).toBe(true);
++    expect(second.startsWith('Artifacts prompt\n')).toBe(true);
++  });
++
++  it('handles missing additional instructions and empty dynamic context', () => {
++    expect(buildAdditionalInstructions(undefined, 'Time: 1')).toBe('Time: 1');
++    expect(buildAdditionalInstructions('Artifacts prompt', '')).toBe('Artifacts prompt');
++    expect(buildAdditionalInstructions(undefined, '')).toBe('');
++  });
++});
++
++describe('sdkMovesDynamicInstructions', () => {
++  it.each([Providers.ANTHROPIC, Providers.OPENROUTER])(
++    'is true for %s with promptCache enabled',
++    (provider) => {
++      expect(sdkMovesDynamicInstructions(provider, { promptCache: true })).toBe(true);
++    },
++  );
++
++  it.each([Providers.ANTHROPIC, Providers.OPENROUTER])(
++    'is false for %s without promptCache',
++    (provider) => {
++      expect(sdkMovesDynamicInstructions(provider, {})).toBe(false);
++      expect(sdkMovesDynamicInstructions(provider, { promptCache: false })).toBe(false);
++      expect(sdkMovesDynamicInstructions(provider, { promptCache: 'true' })).toBe(false);
++      expect(sdkMovesDynamicInstructions(provider, undefined)).toBe(false);
++    },
++  );
++
++  it.each([Providers.OPENAI, Providers.BEDROCK, Providers.GOOGLE, Providers.AZURE, 'custom'])(
++    'is false for %s even with promptCache',
++    (provider) => {
++      expect(sdkMovesDynamicInstructions(provider, { promptCache: true })).toBe(false);
++    },
++  );
++
++  it('is false without a provider', () => {
++    expect(sdkMovesDynamicInstructions(undefined, { promptCache: true })).toBe(false);
++  });
++});
++
++describe('planInstructions', () => {
++  const STABLE = 'Static artifacts prompt.';
++  const VOLATILE = 'Memory: prefers metric units.';
++  const RUNTIME = 'Conversation started: 2026-03-09 23:00 +03:00 (Mon)';
++  const QUEUED_KEY = 'queued_files';
++  const base = {
++    isSubagent: false,
++    provider: Providers.ANTHROPIC,
++    clientOptions: { promptCache: true },
++    toolInstructions: 'Tool guide.',
++    instructions: 'Base instructions.',
++    additionalInstructions: `${VOLATILE}\n\n${STABLE}`,
++    dynamicContextMap: { web_search: RUNTIME, [QUEUED_KEY]: 'queued.csv' },
++    oneTurnContextKey: QUEUED_KEY,
++    split: {
++      stable: STABLE,
++      volatile: VOLATILE,
++      source: `${VOLATILE}\n\n${STABLE}`,
++    },
++  };
++
++  it('puts dynamic tool context ahead of additional instructions when stableContext is off', () => {
++    const plan = planInstructions({ ...base, stableContext: false });
++    expect(plan.instructions).toBe('Tool guide.\nBase instructions.');
++    expect(plan.additionalInstructions).toBe(`${RUNTIME}\nqueued.csv\n${VOLATILE}\n\n${STABLE}`);
++  });
++
++  it('merges the stable part and keeps the volatile and one-turn parts moved', () => {
++    const plan = planInstructions({ ...base, stableContext: true });
++    expect(plan.instructions).toBe(`Tool guide.\nBase instructions.\n\n${STABLE}\n${RUNTIME}`);
++    expect(plan.additionalInstructions).toBe(`${VOLATILE}\n\nqueued.csv`);
++  });
++
++  it('does not merge for a subagent, an uncached provider, or a stale split', () => {
++    for (const override of [
++      { isSubagent: true },
++      { provider: Providers.OPENAI },
++      { clientOptions: {} },
++      { additionalInstructions: `${VOLATILE}\n\n${STABLE}\n\nAdded later.` },
++    ]) {
++      const plan = planInstructions({ ...base, stableContext: true, ...override });
++      expect(plan.instructions).toBe('Tool guide.\nBase instructions.');
++      expect(plan.additionalInstructions).toContain(RUNTIME);
++      expect(plan.additionalInstructions).toContain('queued.csv');
++    }
++  });
++
++  it('treats all additional instructions as stable when no split was recorded', () => {
++    const plan = planInstructions({
++      ...base,
++      stableContext: true,
++      additionalInstructions: STABLE,
++      split: undefined,
++    });
++    expect(plan.instructions).toBe(`Tool guide.\nBase instructions.\n\n${STABLE}\n${RUNTIME}`);
++    expect(plan.additionalInstructions).toBe('queued.csv');
++  });
++
++  it('keeps a split whose stable part is empty from duplicating the volatile part', () => {
++    const plan = planInstructions({
++      ...base,
++      stableContext: true,
++      additionalInstructions: VOLATILE,
++      split: { volatile: VOLATILE, source: VOLATILE },
++    });
++    expect(plan.instructions).toBe(`Tool guide.\nBase instructions.\n\n${RUNTIME}`);
++    expect(plan.additionalInstructions).toBe(`${VOLATILE}\n\nqueued.csv`);
++  });
++});
+diff --git a/packages/data-schemas/src/methods/message.spec.ts b/packages/data-schemas/src/methods/message.spec.ts
+index 74289b959..509aaba0c 100644
+--- a/packages/data-schemas/src/methods/message.spec.ts
++++ b/packages/data-schemas/src/methods/message.spec.ts
+@@ -479,6 +479,13 @@ describe('Message Operations', () => {
+         const stored = await Message.findOne({ messageId: 'msg123' }).lean();
+         expect(stored?.createdAt).toEqual(turnStartedAt);
+       });
++
++      it('leaves the automatic stamp in place without the option', async () => {
++        const before = Date.now();
++        await saveMessage(mockCtx, { ...mockMessageData, createdAt: new Date('2020-01-01') });
++        const stored = await Message.findOne({ messageId: 'msg123' }).lean();
++        expect(stored?.createdAt?.getTime()).toBeGreaterThanOrEqual(before);
++      });
+     });
+ 
+     it('bounds aggregate App BSON without changing canonical output, even on a later full save', async () => {

@@ -1,0 +1,3984 @@
+diff --git a/api/server/controllers/agents/client.test.js b/api/server/controllers/agents/client.test.js
+index 4c119aec9..2637ae308 100644
+--- a/api/server/controllers/agents/client.test.js
++++ b/api/server/controllers/agents/client.test.js
+@@ -5663,7 +5663,9 @@ describe('AgentClient - titleConvo', () => {
+         body: {
+           endpoint: EModelEndpoint.openAI,
+         },
+-        config: {},
++        config: {
++          endpoints: { [EModelEndpoint.agents]: { promptCache: { stableContext: true } } },
++        },
+       };
+ 
+       mockRes = {};
+@@ -5702,7 +5704,7 @@ describe('AgentClient - titleConvo', () => {
+             isCreatedByUser: true,
+           },
+         ],
+-        null,
++        'msg-1',
+         {},
+       );
+ 
+@@ -5713,10 +5715,79 @@ describe('AgentClient - titleConvo', () => {
+       ragContext.resolve('Retrieved context');
+       memoryContext.resolve(undefined);
+       mcpConfig.resolve({});
+-      await buildPromise;
++      const result = await buildPromise;
+ 
+       expect(client.augmentedPrompt).toBe('Retrieved context');
+-      expect(client.options.agent.additional_instructions).toContain('Retrieved context');
++      /** The sent message carries the retrieved context; the system prompt never does. */
++      expect(client.options.agent.additional_instructions ?? '').not.toContain('Retrieved context');
++      expect(result.prompt[0].content).toBe(
++        '<context_update>\nRetrieved context\n</context_update>\n\nLoad all context.',
++      );
++      expect(mockReq.turnContextUpdates).toEqual({
++        messageId: 'msg-1',
++        entries: [{ key: 'rag', value: 'Retrieved context' }],
++      });
++    });
++
++    it('anchors memory in the system prompt and leaves no per-turn part there', async () => {
++      client.contextHandlers = { createContext: jest.fn().mockResolvedValue('Retrieved context') };
++      client.useMemory = jest
++        .fn()
++        .mockResolvedValue({ withKeys: 'Memory note', withoutKeys: 'Memory note' });
++      client.options.agent.additional_instructions = 'Static artifacts prompt';
++
++      await client.buildMessages(
++        [
++          {
++            messageId: 'msg-1',
++            parentMessageId: null,
++            sender: 'User',
++            text: 'Hello',
++            isCreatedByUser: true,
++          },
++        ],
++        null,
++        {},
++      );
++
++      const { assembleAdditionalInstructions } = require('@librechat/api');
++      const additional = client.options.agent.additional_instructions;
++      const volatile = assembleAdditionalInstructions(
++        client.options.agent,
++        ({ kind }) => kind === 'turn',
++      );
++      expect(volatile).toBeUndefined();
++      expect(additional.startsWith('Static artifacts prompt')).toBe(true);
++      expect(additional).toContain('Memory note');
++      expect(additional).not.toContain('Retrieved context');
++    });
++
++    it('assembles the system tail from initialization and memory, RAG going to the message', async () => {
++      const { memoryInstructions } = require('@librechat/api');
++      mockAgent.additional_instructions = 'Agent guidance\n';
++      client.contextHandlers = { createContext: jest.fn(async () => '\nRetrieved context\n') };
++      client.useMemory = jest.fn().mockResolvedValue({ withoutKeys: 'tea: yes\n' });
++
++      const result = await client.buildMessages(
++        [
++          {
++            messageId: 'msg-1',
++            parentMessageId: null,
++            sender: 'User',
++            text: 'Load all context.',
++            isCreatedByUser: true,
++          },
++        ],
++        'msg-1',
++        {},
++      );
++
++      expect(client.options.agent.additional_instructions).toBe(
++        `Agent guidance\n\n${memoryInstructions}\n\n# Existing memory about the user:\ntea: yes`,
++      );
++      expect(result.prompt[0].content).toBe(
++        '<context_update>\nRetrieved context\n</context_update>\n\nLoad all context.',
++      );
+     });
+ 
+     it('starts independent context and current-file work at their earliest dependency barriers', async () => {
+@@ -7792,7 +7863,7 @@ describe('AgentClient - titleConvo', () => {
+       const PROJECT = 'Project guidance: quote prices in EUR.';
+       const ANCHOR = [
+         { key: 'runtime:web_search', value: WEB_SEARCH },
+-        { key: 'date', value: '2026-03-09 (Monday)' },
++        { key: 'date', value: '2026-03-09 (Mon)' },
+       ];
+       const conversationHistory = ({ firstUpdates, currentUpdates, summary } = {}) => [
+         {
+@@ -7874,7 +7945,7 @@ describe('AgentClient - titleConvo', () => {
+ 
+         expect(result.prompt[0].content).toBe('First question');
+         expect(result.prompt[2].content).toBe(
+-          '<context_update>\nCurrent date changed to: 2026-03-10 (Tuesday)\n</context_update>\n\nNext question',
++          '<context_update>\nCurrent date changed to: 2026-03-10 (Tue)\n</context_update>\n\nNext question',
+         );
+         expect(result.tokenCountMap['msg-3']).toBe(10);
+         expect(client.indexTokenCountMap[2]).toBe(90);
+@@ -7883,11 +7954,11 @@ describe('AgentClient - titleConvo', () => {
+         expect(client.memoryPayload[2].content).toBe('Next question');
+         expect(mockReq.turnContextUpdates).toEqual({
+           messageId: 'msg-3',
+-          entries: [{ key: 'date', value: '2026-03-10 (Tuesday)' }],
++          entries: [{ key: 'date', value: '2026-03-10 (Tue)' }],
+         });
+         expect(client.pendingContextAnchor).toBeUndefined();
+         expect(mockAgent.additional_instructions).toBe(
+-          `${WEB_SEARCH}\n\nCurrent date: 2026-03-09 (Monday)`,
++          `${WEB_SEARCH}\n\nCurrent date: 2026-03-09 (Mon)`,
+         );
+       });
+ 
+@@ -7899,20 +7970,43 @@ describe('AgentClient - titleConvo', () => {
+           },
+         };
+         const history = conversationHistory({
+-          firstUpdates: [{ key: 'message_time', value: '2026-03-09 20:00:00 +00:00 (Monday)' }],
++          firstUpdates: [{ key: 'message_time', value: '2026-03-09 20:00:00 +00:00 (Mon)' }],
+         });
+ 
+         const result = await client.buildMessages(history, 'msg-3', {});
+ 
+         expect(result.prompt[0].content).toBe(
+-          '<context_update>\nMessage sent: 2026-03-09 20:00:00 +00:00 (Monday)\n</context_update>\n\nFirst question',
++          '<context_update>\nMessage sent: 2026-03-09 20:00:00 +00:00 (Mon)\n</context_update>\n\nFirst question',
+         );
+         expect(result.prompt[2].content).toBe(
+-          '<context_update>\nCurrent date changed to: 2026-03-10 (Tuesday)\nMessage sent: 2026-03-10 09:00:00 +00:00 (Tuesday)\n</context_update>\n\nNext question',
++          '<context_update>\nCurrent date changed to: 2026-03-10 (Tue)\nMessage sent: 2026-03-10 09:00:00 +00:00 (Tue)\n</context_update>\n\nNext question',
+         );
+         expect(client.memoryPayload[0].content).toBe('First question');
+       });
+ 
++      it('leaves messages untouched and stores nothing when nothing changed', async () => {
++        mockReq.turnStartedAt = Date.parse('2026-03-09T21:00:00.000Z');
++
++        const result = await client.buildMessages(conversationHistory(), 'msg-3', {});
++
++        expect(result.prompt[2].content).toBe('Next question');
++        expect(client.indexTokenCountMap[2]).toBe(10);
++        expect(client.memoryPayload).toBeNull();
++        expect(mockReq.turnContextUpdates).toBeUndefined();
++      });
++
++      it('writes nothing for a regeneration, which renders the entries stored with its message', async () => {
++        mockReq.turnStartedAt = Date.parse('2026-03-10T09:00:00.000Z');
++        const history = conversationHistory({
++          currentUpdates: [{ key: 'date', value: '2026-03-10 (Tue)' }],
++        });
++
++        const result = await client.buildMessages(history, 'msg-3', {}, { isRegenerate: true });
++
++        expect(mockReq.turnContextUpdates).toBeUndefined();
++        expect(promptText(result.prompt[2])).toContain('Current date changed to: 2026-03-10 (Tue)');
++      });
++
+       it('anchors a conversation without an anchor to this turn and keeps it for the next save', async () => {
+         models().getConvoContextAnchor.mockResolvedValue(null);
+         api().contributeContext(mockAgent, 'project', PROJECT);
+@@ -7925,12 +8019,12 @@ describe('AgentClient - titleConvo', () => {
+           anchor: [
+             { key: 'project', value: PROJECT },
+             { key: 'runtime:web_search', value: WEB_SEARCH },
+-            { key: 'date', value: '2026-03-10 (Tuesday)' },
++            { key: 'date', value: '2026-03-10 (Tue)' },
+           ],
+         });
+         expect(result.prompt[2].content).toBe('Next question');
+         expect(mockAgent.additional_instructions).toBe(
+-          `${PROJECT}\n\n${WEB_SEARCH}\n\nCurrent date: 2026-03-10 (Tuesday)`,
++          `${PROJECT}\n\n${WEB_SEARCH}\n\nCurrent date: 2026-03-10 (Tue)`,
+         );
+       });
+ 
+@@ -7957,6 +8051,18 @@ describe('AgentClient - titleConvo', () => {
+         expect(result.tokenCountMap['msg-3']).toBe(10);
+       });
+ 
++      it('stores nothing for a continued response and replays stored updates', async () => {
++        const history = conversationHistory({
++          firstUpdates: [{ key: 'artifacts', value: 'default' }],
++        }).slice(0, 2);
++        toggleArtifacts();
++
++        const result = await client.buildMessages(history, 'msg-2', {}, { isEdited: true });
++
++        expect(mockReq.turnContextUpdates).toBeUndefined();
++        expect(promptText(result.prompt[0])).toContain('Artifacts instructions:');
++      });
++
+       it('announces changed memory as a snapshot, keeping it out of the system prompt and the memory copy', async () => {
+         const anchoredMemory = api().formatMemoryContext('tea: yes');
+         models().getConvoContextAnchor.mockResolvedValue([
+@@ -7979,6 +8085,24 @@ describe('AgentClient - titleConvo', () => {
+         );
+       });
+ 
++      it('withholds memory everywhere while the user has it switched off', async () => {
++        models().getConvoContextAnchor.mockResolvedValue([
++          ...ANCHOR,
++          { key: 'memory', value: 'Existing memory: likes tea.' },
++        ]);
++        const history = conversationHistory({
++          firstUpdates: [{ key: 'memory', value: 'Existing memory: likes coffee.' }],
++        });
++
++        const result = await client.buildMessages(history, 'msg-3', {});
++
++        expect(mockAgent.additional_instructions).not.toContain('likes');
++        expect(JSON.stringify(result.prompt)).not.toContain('likes');
++        expect(mockReq.turnContextUpdates.entries).toEqual([
++          { key: 'date', value: '2026-03-10 (Tue)' },
++        ]);
++      });
++
+       it('re-anchors the first turn after a compaction on the message carrying the summary', async () => {
+         mockReq.turnStartedAt = Date.parse('2026-03-09T21:00:00.000Z');
+         const artifactsPrompt = toggleArtifacts();
+@@ -8060,6 +8184,54 @@ describe('AgentClient - titleConvo', () => {
+         expect(handoffAgent.additional_instructions).not.toContain('tea: yes');
+       });
+ 
++      it('rebuilds a resumed turn from the anchor of the paused turn, not from the live state', async () => {
++        const { assembleSystemPrompt } = api();
++        models().getConvoContextAnchor.mockResolvedValue([
++          { key: 'project', value: PROJECT },
++          ...ANCHOR,
++        ]);
++        mockReq.turnStartedAt = Date.parse('2026-03-09T21:00:00.000Z');
++        toggleArtifacts();
++        await client.buildMessages(conversationHistory(), 'msg-3', {});
++        const pausedSystem = assembleSystemPrompt(mockAgent);
++        const stored = conversationHistory().map((row) =>
++          row.messageId === 'msg-3'
++            ? { ...row, contextUpdates: mockReq.turnContextUpdates.entries }
++            : row,
++        );
++
++        /** Re-initialized at resume after the user switched artifacts off and changed the project. */
++        const resumedAgent = {
++          id: mockAgent.id,
++          endpoint: mockAgent.endpoint,
++          provider: mockAgent.provider,
++          instructions: 'Primary instructions',
++          model_parameters: { model: 'gpt-4' },
++          tools: [],
++          dynamicToolContextMap: { web_search: WEB_SEARCH },
++        };
++        api().contributeContext(resumedAgent, 'project', 'Project guidance: quote prices in USD.');
++        models().getMessages.mockResolvedValueOnce(stored);
++
++        const { plan } = await api().prepareResumedTurnContext({
++          req: mockReq,
++          agent: resumedAgent,
++          conversationId: 'convo-123',
++          pausedMessageId: 'msg-3',
++          db: models(),
++          getBranch: AgentClient.getMessagesForConversation,
++          loadMemories: async () => undefined,
++        });
++        api().applyTurnContext(resumedAgent, plan);
++
++        expect(plan.currentEntries).toBeUndefined();
++        expect(assembleSystemPrompt(resumedAgent)).toEqual(pausedSystem);
++        expect(models().getMessages).toHaveBeenLastCalledWith(
++          { conversationId: 'convo-123', user: 'user-123' },
++          '+contextUpdates +contextAnchor',
++        );
++      });
++
+       it('keeps the prompt live and reads no anchor without stableContext', async () => {
+         mockReq.config.endpoints = { [EModelEndpoint.agents]: {} };
+         const artifactsPrompt = toggleArtifacts();
+@@ -8075,67 +8247,28 @@ describe('AgentClient - titleConvo', () => {
+         expect(result.prompt[2].content).toBe('Next question');
+       });
+ 
+-      it('builds the prompt exactly as upstream without the settings', async () => {
+-        mockReq.config.endpoints = {};
+-        mockAgent.additional_instructions = 'Agent context';
+-        client.contextHandlers = { createContext: jest.fn().mockResolvedValue('Passage 7919') };
+-        client.useMemory = jest.fn().mockResolvedValue({ withoutKeys: 'tea: no' });
++      it('takes the anchor from the conversation the ingress read, without a read of its own', async () => {
++        mockReq.resolvedConversation = { contextAnchor: ANCHOR };
++        models().getConvoContextAnchor.mockRejectedValue(new Error('must not be read'));
+ 
+-        const result = await client.buildMessages(conversationHistory(), 'msg-3', {});
++        await client.buildMessages(conversationHistory(), 'msg-3', {});
+ 
+-        expect({
+-          prompt: result.prompt,
+-          tokenCountMap: result.tokenCountMap,
+-          indexTokenCountMap: client.indexTokenCountMap,
+-          memoryPayload: client.memoryPayload,
+-          instructions: mockAgent.instructions,
+-          additional_instructions: mockAgent.additional_instructions,
+-          dynamicToolContextMap: mockAgent.dynamicToolContextMap,
+-        }).toMatchInlineSnapshot(`
+-          {
+-            "additional_instructions": "Agent context
++        expect(models().getConvoContextAnchor).not.toHaveBeenCalled();
++        expect(client.pendingContextAnchor).toBeUndefined();
++      });
+ 
+-          Passage 7919
++      it('leaves the system prompt live when the anchor cannot be read', async () => {
++        models().getConvoContextAnchor.mockRejectedValue(new Error('read failed'));
++        const artifactsPrompt = toggleArtifacts();
+ 
+-          Persistent memory is available across conversations within the current memory scope. Saved memories, if any, are shown below. No entries shown here does not mean memory is unavailable. Use memory tools only if provided; claim a memory was saved or deleted only after the action is confirmed.
++        const result = await client.buildMessages(conversationHistory(), 'msg-3', {});
+ 
+-          # Existing memory about the user:
+-          tea: no",
+-            "dynamicToolContextMap": {
+-              "web_search": "# \`web_search\` Runtime Context
+-          Conversation started: 2026-03-09",
+-            },
+-            "indexTokenCountMap": {
+-              "0": 5,
+-              "1": 5,
+-              "2": 10,
+-            },
+-            "instructions": "Primary instructions",
+-            "memoryPayload": null,
+-            "prompt": [
+-              {
+-                "content": "First question",
+-                "messageId": "msg-1",
+-                "role": "user",
+-              },
+-              {
+-                "content": "First answer",
+-                "messageId": "msg-2",
+-                "role": "assistant",
+-              },
+-              {
+-                "content": "Next question",
+-                "messageId": "msg-3",
+-                "role": "user",
+-              },
+-            ],
+-            "tokenCountMap": {
+-              "msg-1": 5,
+-              "msg-2": 5,
+-              "msg-3": 10,
+-            },
+-          }
+-        `);
++        expect(mockAgent.additional_instructions).toBe(artifactsPrompt);
++        /** Without a plan the history keeps the date-change notes of the live path. */
++        expect(result.prompt[2].content).toBe(
++          '<context_update>\nCurrent date changed to: 2026-03-10 (Tue)\n</context_update>\n\nNext question',
++        );
++        expect(mockReq.turnContextUpdates).toBeUndefined();
+       });
+     });
+ 
+@@ -10336,7 +10469,9 @@ describe('AgentClient - resumeCompletion content protection', () => {
+         user: { id: 'user-123' },
+         body: { files: [] },
+         config: {
+-          endpoints: { [EModelEndpoint.agents]: { checkpointer: {} } },
++          endpoints: {
++            [EModelEndpoint.agents]: { checkpointer: {}, promptCache: { stableContext: true } },
++          },
+           filters,
+         },
+       },
+@@ -10529,9 +10664,6 @@ describe('AgentClient - resumeCompletion content protection', () => {
+       getCalibrationRatio: jest.fn(() => 0),
+     });
+     const context = makeContext();
+-    context.options.req.config.endpoints[EModelEndpoint.agents].promptCache = {
+-      stableContext: true,
+-    };
+     context.useMemory = jest.fn().mockResolvedValue(undefined);
+     api.contributeContext(context.options.agent, 'project', 'Live project.');
+     api.contributeContext(context.options.agent, 'artifacts', 'Live artifacts.');
+diff --git a/api/server/services/__tests__/ToolService.spec.js b/api/server/services/__tests__/ToolService.spec.js
+index 8cb1ad44e..84c63f8ae 100644
+--- a/api/server/services/__tests__/ToolService.spec.js
++++ b/api/server/services/__tests__/ToolService.spec.js
+@@ -193,7 +193,7 @@ const {
+ } = require('../ToolService');
+ const { createOnSearchResults } = require('~/server/services/Tools/search');
+ const { reinitMCPServer } = require('~/server/services/Tools/mcp');
+-const { ContentFilterError, PENDING_STALE_MS, ToolInputError } = require('@librechat/api');
++const { ContentFilterError, PENDING_STALE_MS } = require('@librechat/api');
+ 
+ /** Role document shape `checkAccess` reads; all three role-gated tools granted. */
+ function buildRole(overrides = {}) {
+@@ -689,46 +689,6 @@ describe('ToolService - Action Capability Gating', () => {
+       expect(output).not.toContain('bearer_header');
+     });
+ 
+-    it('returns approved tool error text instead of a raw exception message', async () => {
+-      const rawMessage =
+-        'connect ECONNREFUSED 10.0.0.5:443 for https://api.example.test/?q=PRIVATE';
+-      mockLoadToolsUtil.mockResolvedValue({
+-        loadedTools: [
+-          { name: 'safe_tool', _call: jest.fn().mockRejectedValue(new Error(rawMessage)) },
+-        ],
+-        toolContextMap: {},
+-      });
+-
+-      const result = await processRequiredActions(buildClient(undefined), [buildAction()]);
+-
+-      expect(result.tool_outputs).toEqual([
+-        {
+-          tool_call_id: 'call_1',
+-          output: 'Error processing tool safe_tool: The tool request failed.',
+-        },
+-      ]);
+-    });
+-
+-    it('keeps the message of a tool input error the tool wrote for the model', async () => {
+-      mockLoadToolsUtil.mockResolvedValue({
+-        loadedTools: [
+-          {
+-            name: 'safe_tool',
+-            _call: jest
+-              .fn()
+-              .mockRejectedValue(new ToolInputError('Could not find coordinates for city: Rome')),
+-          },
+-        ],
+-        toolContextMap: {},
+-      });
+-
+-      const result = await processRequiredActions(buildClient(undefined), [buildAction()]);
+-
+-      expect(result.tool_outputs[0].output).toBe(
+-        'Error processing tool safe_tool: Could not find coordinates for city: Rome',
+-      );
+-    });
+-
+     it('blocks persisted Assistant action metadata before required-action execution', async () => {
+       const actionToolName = `get_weather${actionDelimiter}api_example_com`;
+       const filters = {
+@@ -1237,46 +1197,6 @@ describe('ToolService - Action Capability Gating', () => {
+       expect(callArgs.tools).not.toContain(actionToolName);
+     });
+ 
+-    it('dates the web search context by the turn start as upstream without stableContext', async () => {
+-      const capabilities = [AgentCapabilities.tools, AgentCapabilities.web_search];
+-      const req = createMockReq(capabilities);
+-      req.conversationCreatedAt = '2026-08-25T10:00:00.000Z';
+-      req.turnStartedAt = Date.parse('2026-08-31T06:20:00.000Z');
+-      mockGetEndpointsConfig.mockResolvedValue(createEndpointsConfig(capabilities));
+-
+-      const result = await loadAgentTools({
+-        req,
+-        res: {},
+-        agent: { id: 'agent_123', tools: [Tools.web_search] },
+-        definitionsOnly: true,
+-      });
+-
+-      expect(result.dynamicToolContextMap).toMatchInlineSnapshot(`
+-        {
+-          "web_search": "# \`web_search\` Runtime Context
+-        Conversation Date & Time: 2026-08-31T06:20:00.000Z",
+-        }
+-      `);
+-    });
+-
+-    it('dates the web search context by the conversation start with stableContext', async () => {
+-      const capabilities = [AgentCapabilities.tools, AgentCapabilities.web_search];
+-      const req = createMockReq(capabilities);
+-      req.config.endpoints[EModelEndpoint.agents].promptCache = { stableContext: true };
+-      req.conversationCreatedAt = '2026-08-25T10:00:00.000Z';
+-      req.turnStartedAt = Date.parse('2026-08-31T06:20:00.000Z');
+-      mockGetEndpointsConfig.mockResolvedValue(createEndpointsConfig(capabilities));
+-
+-      const result = await loadAgentTools({
+-        req,
+-        res: {},
+-        agent: { id: 'agent_123', tools: [Tools.web_search] },
+-        definitionsOnly: true,
+-      });
+-
+-      expect(result.dynamicToolContextMap[Tools.web_search]).toContain('2026-08-25T10:00:00.000Z');
+-    });
+-
+     it('should include action tools in definitions when actions capability is enabled', async () => {
+       const capabilities = [AgentCapabilities.tools, AgentCapabilities.actions];
+       const req = createMockReq(capabilities);
+diff --git a/packages/api/src/agents/__tests__/__snapshots__/systemParts.snapshot.test.ts.snap b/packages/api/src/agents/__tests__/__snapshots__/systemParts.snapshot.test.ts.snap
+new file mode 100644
+index 000000000..cab7181e4
+--- /dev/null
++++ b/packages/api/src/agents/__tests__/__snapshots__/systemParts.snapshot.test.ts.snap
+@@ -0,0 +1,460 @@
++// Jest Snapshot v1, https://jestjs.io/docs/snapshot-testing
++
++exports[`system prompt assembly is byte-identical to string concatenation (stableContext false) agent files only 1`] = `
++[
++  {
++    "additional_instructions": "Attached file context:
++quarterly.txt: revenue up",
++    "agentId": "agent_main",
++    "instructions": "",
++    "subagents": [],
++  },
++]
++`;
++
++exports[`system prompt assembly is byte-identical to string concatenation (stableContext false) anthropic promptCache: everything 1`] = `
++[
++  {
++    "additional_instructions": "# \`web_search\` Runtime Context
++Conversation Date & Time: 2026-03-09T20:30:00.000Z
++- Note: files are available in "/mnt/data/":
++	- data.csv
++- Note: Semantic search is available through:
++	- report.pdf
++- Images available for image editing:
++	- photo.png
++- Note: The following files are available in the "execute_code" tool environment:
++	- /mnt/data/data.csv (attached by user)
++Files are staged at these paths on demand for code execution. You can read or edit them even when their extracted text is already in context.
++Agent dynamic guidance.
++
++Project guidance (user-provided context; subordinate to system, platform, agent, and tool policies):
++Use metric units.
++
++Only use the \`set_memory\` and \`delete_memory\` tools when the user explicitly asks you to remember, update, or forget something (e.g. "remember that...", "don't forget...", "forget..."). Never store information merely because the user mentioned it in conversation.
++
++Base. Today is 2026-03-09 (Monday).
++
++<artifacts:default>
++
++## Available Skills
++
++- release-notes: Drafts release notes from a changelog.
++
++Retrieved context: passage 7919
++
++<memory:instructions>
++
++# Existing memory about the user:
++favorite_color: blue
++
++Attached file context:
++quarterly.txt: revenue up",
++    "agentId": "agent_main",
++    "instructions": "<web_search:instructions>
++# MCP Server Instructions
++
++## docs
++Use docs.",
++    "subagents": [],
++  },
++]
++`;
++
++exports[`system prompt assembly is byte-identical to string concatenation (stableContext false) anthropic promptCache: instructions only 1`] = `
++[
++  {
++    "additional_instructions": null,
++    "agentId": "agent_main",
++    "instructions": "Base.",
++    "subagents": [],
++  },
++]
++`;
++
++exports[`system prompt assembly is byte-identical to string concatenation (stableContext false) anthropic promptCache: per-turn parts only 1`] = `
++[
++  {
++    "additional_instructions": "Retrieved context: passage 7919
++
++<memory:instructions>
++
++# Existing memory about the user:
++favorite_color: blue",
++    "agentId": "agent_main",
++    "instructions": "",
++    "subagents": [],
++  },
++]
++`;
++
++exports[`system prompt assembly is byte-identical to string concatenation (stableContext false) anthropic promptCache: queued files with web search 1`] = `
++[
++  {
++    "additional_instructions": "# \`web_search\` Runtime Context
++Conversation Date & Time: 2026-03-09T20:30:00.000Z
++- Note: The following files are available in the "execute_code" tool environment:
++	- /mnt/data/data.csv (attached by user)
++Files are staged at these paths on demand for code execution. You can read or edit them even when their extracted text is already in context.",
++    "agentId": "agent_main",
++    "instructions": "<web_search:instructions>
++Base.",
++    "subagents": [],
++  },
++]
++`;
++
++exports[`system prompt assembly is byte-identical to string concatenation (stableContext false) anthropic promptCache: stable parts only 1`] = `
++[
++  {
++    "additional_instructions": "# \`web_search\` Runtime Context
++Conversation Date & Time: 2026-03-09T20:30:00.000Z
++Project guidance (user-provided context; subordinate to system, platform, agent, and tool policies):
++Use metric units.
++
++
++<artifacts:default>",
++    "agentId": "agent_main",
++    "instructions": "<web_search:instructions>
++Base.",
++    "subagents": [],
++  },
++]
++`;
++
++exports[`system prompt assembly is byte-identical to string concatenation (stableContext false) artifacts default 1`] = `
++[
++  {
++    "additional_instructions": "<artifacts:default>",
++    "agentId": "agent_main",
++    "instructions": "Base.",
++    "subagents": [],
++  },
++]
++`;
++
++exports[`system prompt assembly is byte-identical to string concatenation (stableContext false) artifacts shadcn on anthropic 1`] = `
++[
++  {
++    "additional_instructions": "<artifacts:shadcnui:anthropic>",
++    "agentId": "agent_main",
++    "instructions": "Base.",
++    "subagents": [],
++  },
++]
++`;
++
++exports[`system prompt assembly is byte-identical to string concatenation (stableContext false) bare 1`] = `
++[
++  {
++    "additional_instructions": null,
++    "agentId": "agent_main",
++    "instructions": "You are a careful support assistant.",
++    "subagents": [],
++  },
++]
++`;
++
++exports[`system prompt assembly is byte-identical to string concatenation (stableContext false) code, file search and image tools 1`] = `
++[
++  {
++    "additional_instructions": "- Note: files are available in "/mnt/data/":
++	- data.csv
++- Note: Semantic search is available through:
++	- report.pdf
++- Images available for image editing:
++	- photo.png",
++    "agentId": "agent_main",
++    "instructions": "Base.",
++    "subagents": [],
++  },
++]
++`;
++
++exports[`system prompt assembly is byte-identical to string concatenation (stableContext false) everything with MCP 1`] = `
++[
++  {
++    "additional_instructions": "# \`web_search\` Runtime Context
++Conversation Date & Time: 2026-03-09T20:30:00.000Z
++- Note: files are available in "/mnt/data/":
++	- data.csv
++- Note: Semantic search is available through:
++	- report.pdf
++- Images available for image editing:
++	- photo.png
++- Note: The following files are available in the "execute_code" tool environment:
++	- /mnt/data/data.csv (attached by user)
++Files are staged at these paths on demand for code execution. You can read or edit them even when their extracted text is already in context.
++Agent dynamic guidance.
++
++Project guidance (user-provided context; subordinate to system, platform, agent, and tool policies):
++Use metric units.
++
++Only use the \`set_memory\` and \`delete_memory\` tools when the user explicitly asks you to remember, update, or forget something (e.g. "remember that...", "don't forget...", "forget..."). Never store information merely because the user mentioned it in conversation.
++
++Base. Today is 2026-03-09 (Monday).
++
++<artifacts:default>
++
++## Available Skills
++
++- release-notes: Drafts release notes from a changelog.
++
++Retrieved context: passage 7919
++
++<memory:instructions>
++
++# Existing memory about the user:
++favorite_color: blue
++
++Attached file context:
++quarterly.txt: revenue up",
++    "agentId": "agent_main",
++    "instructions": "<web_search:instructions>
++# MCP Server Instructions
++
++## docs
++Use docs.",
++    "subagents": [],
++  },
++]
++`;
++
++exports[`system prompt assembly is byte-identical to string concatenation (stableContext false) handoff 1`] = `
++[
++  {
++    "additional_instructions": "# \`web_search\` Runtime Context
++Conversation Date & Time: 2026-03-09T20:30:00.000Z
++<artifacts:default>",
++    "agentId": "agent_router",
++    "instructions": "<web_search:instructions>
++Route.",
++    "subagents": [],
++  },
++  {
++    "additional_instructions": "Only use the \`set_memory\` and \`delete_memory\` tools when the user explicitly asks you to remember, update, or forget something (e.g. "remember that...", "don't forget...", "forget..."). Never store information merely because the user mentioned it in conversation.
++
++<memory:instructions>
++
++# Existing memory about the user:
++tone: formal",
++    "agentId": "agent_writer",
++    "instructions": "Write.",
++    "subagents": [],
++  },
++]
++`;
++
++exports[`system prompt assembly is byte-identical to string concatenation (stableContext false) isolated subagent with an always-apply skill and runtime context (promptCache false) 1`] = `
++[
++  {
++    "additional_instructions": "# \`web_search\` Runtime Context
++Conversation Date & Time: 2026-03-09T20:30:00.000Z
++Retrieved context: passage 7919
++
++<memory:instructions>
++
++# Existing memory about the user:
++favorite_color: blue",
++    "agentId": "agent_main",
++    "instructions": "<web_search:instructions>
++Parent.",
++    "subagents": [
++      {
++        "additional_instructions": "# \`web_search\` Runtime Context
++Conversation Date & Time: 2026-03-09T20:30:00.000Z
++<artifacts:default>
++
++<memory:instructions>
++
++# Existing memory about the user:
++favorite_color: blue
++
++# Always-apply skill: house-style
++Use sentence case.
++",
++        "agentId": "agent_child",
++        "instructions": "<web_search:instructions>
++Child.",
++        "subagents": [],
++      },
++    ],
++  },
++]
++`;
++
++exports[`system prompt assembly is byte-identical to string concatenation (stableContext false) isolated subagent with an always-apply skill and runtime context (promptCache true) 1`] = `
++[
++  {
++    "additional_instructions": "# \`web_search\` Runtime Context
++Conversation Date & Time: 2026-03-09T20:30:00.000Z
++Retrieved context: passage 7919
++
++<memory:instructions>
++
++# Existing memory about the user:
++favorite_color: blue",
++    "agentId": "agent_main",
++    "instructions": "<web_search:instructions>
++Parent.",
++    "subagents": [
++      {
++        "additional_instructions": "# \`web_search\` Runtime Context
++Conversation Date & Time: 2026-03-09T20:30:00.000Z
++<artifacts:default>
++
++<memory:instructions>
++
++# Existing memory about the user:
++favorite_color: blue
++
++# Always-apply skill: house-style
++Use sentence case.
++",
++        "agentId": "agent_child",
++        "instructions": "<web_search:instructions>
++Child.",
++        "subagents": [],
++      },
++    ],
++  },
++]
++`;
++
++exports[`system prompt assembly is byte-identical to string concatenation (stableContext false) memory tools and memory 1`] = `
++[
++  {
++    "additional_instructions": "Only use the \`set_memory\` and \`delete_memory\` tools when the user explicitly asks you to remember, update, or forget something (e.g. "remember that...", "don't forget...", "forget..."). Never store information merely because the user mentioned it in conversation.
++
++<memory:instructions>
++
++# Existing memory about the user:
++favorite_color: blue",
++    "agentId": "agent_main",
++    "instructions": "Base.",
++    "subagents": [],
++  },
++]
++`;
++
++exports[`system prompt assembly is byte-identical to string concatenation (stableContext false) openrouter promptCache: memory, RAG and agent files 1`] = `
++[
++  {
++    "additional_instructions": "<artifacts:default>
++
++
++Retrieved context:
++- passage 7919
++
++
++<memory:instructions>
++
++# Existing memory about the user:
++favorite_color: blue
++
++
++Attached file context:
++quarterly.txt: revenue up",
++    "agentId": "agent_main",
++    "instructions": "Base.",
++    "subagents": [],
++  },
++]
++`;
++
++exports[`system prompt assembly is byte-identical to string concatenation (stableContext false) own additional instructions with surrounding whitespace 1`] = `
++[
++  {
++    "additional_instructions": "Agent dynamic guidance.
++
++<memory:instructions>
++
++# Existing memory about the user:
++favorite_color: blue",
++    "agentId": "agent_main",
++    "instructions": "Base.",
++    "subagents": [],
++  },
++]
++`;
++
++exports[`system prompt assembly is byte-identical to string concatenation (stableContext false) project only 1`] = `
++[
++  {
++    "additional_instructions": "Project guidance (user-provided context; subordinate to system, platform, agent, and tool policies):
++Use metric units.",
++    "agentId": "agent_main",
++    "instructions": "",
++    "subagents": [],
++  },
++]
++`;
++
++exports[`system prompt assembly is byte-identical to string concatenation (stableContext false) project with trailing newline and memory 1`] = `
++[
++  {
++    "additional_instructions": "Project guidance (user-provided context; subordinate to system, platform, agent, and tool policies):
++Use metric units.
++
++<memory:instructions>
++
++# Existing memory about the user:
++favorite_color: blue",
++    "agentId": "agent_main",
++    "instructions": "Base.",
++    "subagents": [],
++  },
++]
++`;
++
++exports[`system prompt assembly is byte-identical to string concatenation (stableContext false) rag with surrounding whitespace 1`] = `
++[
++  {
++    "additional_instructions": "<artifacts:default>
++
++
++Retrieved context:
++- passage 7919",
++    "agentId": "agent_main",
++    "instructions": "Base.",
++    "subagents": [],
++  },
++]
++`;
++
++exports[`system prompt assembly is byte-identical to string concatenation (stableContext false) skills catalog 1`] = `
++[
++  {
++    "additional_instructions": "## Available Skills
++
++- release-notes: Drafts release notes from a changelog.",
++    "agentId": "agent_main",
++    "instructions": "Base.",
++    "subagents": [],
++  },
++]
++`;
++
++exports[`system prompt assembly is byte-identical to string concatenation (stableContext false) temporal instructions 1`] = `
++[
++  {
++    "additional_instructions": "Today is 2026-03-09 (Monday). Be brief.",
++    "agentId": "agent_main",
++    "instructions": "",
++    "subagents": [],
++  },
++]
++`;
++
++exports[`system prompt assembly is byte-identical to string concatenation (stableContext false) web search 1`] = `
++[
++  {
++    "additional_instructions": "# \`web_search\` Runtime Context
++Conversation Date & Time: 2026-03-09T20:30:00.000Z",
++    "agentId": "agent_main",
++    "instructions": "<web_search:instructions>
++Base.",
++    "subagents": [],
++  },
++]
++`;
+diff --git a/packages/api/src/agents/__tests__/helpers/providerCapture.ts b/packages/api/src/agents/__tests__/helpers/providerCapture.ts
+new file mode 100644
+index 000000000..e217436ae
+--- /dev/null
++++ b/packages/api/src/agents/__tests__/helpers/providerCapture.ts
+@@ -0,0 +1,278 @@
++/**
++ * Runs one agent turn through the real `createRun` and provider chat model
++ * classes and records every serialized provider request right before it would
++ * leave the process: fetch-based clients through a mocked global `fetch`,
++ * Bedrock through an injected runtime client. A request is answered with the
++ * scripted response for its position, or aborted when none is scripted, so no
++ * request reaches the network.
++ */
++import { Providers } from '@librechat/agents';
++import type { BaseMessage } from '@librechat/agents/langchain/messages';
++import { createRun } from '../../run';
++
++export const CAPTURED = 'request captured before network';
++
++export type RequestFormat = 'openai' | 'anthropic' | 'google' | 'bedrock';
++
++export interface ProviderCase {
++  name: string;
++  provider: string;
++  endpoint?: string;
++  format: RequestFormat;
++  modelParameters: Record<string, unknown>;
++}
++
++export interface Captured {
++  system: unknown;
++  tools: unknown;
++  messages: unknown[];
++}
++
++const OPENAI_KEY = { apiKey: 'test-key', maxRetries: 0 };
++
++export const PROVIDERS: ProviderCase[] = [
++  {
++    name: 'openAI',
++    provider: Providers.OPENAI,
++    format: 'openai',
++    modelParameters: { model: 'gpt-4.1', ...OPENAI_KEY },
++  },
++  {
++    name: 'custom OpenAI-compatible (vLLM)',
++    provider: Providers.OPENAI,
++    endpoint: 'vLLM',
++    format: 'openai',
++    modelParameters: {
++      model: 'local-model',
++      ...OPENAI_KEY,
++      configuration: { baseURL: 'https://vllm.invalid/v1' },
++    },
++  },
++  {
++    name: 'azureOpenAI',
++    provider: Providers.AZURE,
++    format: 'openai',
++    modelParameters: {
++      model: 'gpt-4.1',
++      azureOpenAIApiKey: 'test-key',
++      azureOpenAIApiInstanceName: 'instance',
++      azureOpenAIApiDeploymentName: 'deployment',
++      azureOpenAIApiVersion: '2024-10-21',
++      maxRetries: 0,
++    },
++  },
++  {
++    name: 'anthropic',
++    provider: Providers.ANTHROPIC,
++    format: 'anthropic',
++    modelParameters: { model: 'claude-sonnet-4-5', ...OPENAI_KEY },
++  },
++  {
++    name: 'anthropic with promptCache',
++    provider: Providers.ANTHROPIC,
++    format: 'anthropic',
++    modelParameters: { model: 'claude-sonnet-4-5', ...OPENAI_KEY, promptCache: true },
++  },
++  {
++    name: 'openrouter',
++    provider: Providers.OPENROUTER,
++    format: 'openai',
++    modelParameters: { model: 'openai/gpt-4.1', ...OPENAI_KEY },
++  },
++  {
++    name: 'openrouter with promptCache',
++    provider: Providers.OPENROUTER,
++    format: 'openai',
++    modelParameters: { model: 'anthropic/claude-sonnet-4.5', ...OPENAI_KEY, promptCache: true },
++  },
++  {
++    name: 'bedrock',
++    provider: Providers.BEDROCK,
++    format: 'bedrock',
++    modelParameters: {
++      model: 'anthropic.claude-sonnet-4-5-20250929-v1:0',
++      region: 'us-east-1',
++      credentials: { accessKeyId: 'test', secretAccessKey: 'test' },
++      maxRetries: 0,
++    },
++  },
++  {
++    name: 'bedrock with promptCache',
++    provider: Providers.BEDROCK,
++    format: 'bedrock',
++    modelParameters: {
++      model: 'anthropic.claude-sonnet-4-5-20250929-v1:0',
++      region: 'us-east-1',
++      credentials: { accessKeyId: 'test', secretAccessKey: 'test' },
++      maxRetries: 0,
++      promptCache: true,
++    },
++  },
++  {
++    name: 'google',
++    provider: Providers.GOOGLE,
++    format: 'google',
++    modelParameters: { model: 'gemini-2.5-flash', ...OPENAI_KEY },
++  },
++  {
++    /** Vertex AI express mode: an API key instead of service account credentials. */
++    name: 'vertexai',
++    provider: Providers.VERTEXAI,
++    format: 'google',
++    modelParameters: { model: 'gemini-2.5-flash', ...OPENAI_KEY },
++  },
++  {
++    name: 'mistralai',
++    provider: Providers.MISTRALAI,
++    format: 'openai',
++    modelParameters: { model: 'mistral-large-latest', ...OPENAI_KEY },
++  },
++  {
++    name: 'deepseek',
++    provider: Providers.DEEPSEEK,
++    format: 'openai',
++    modelParameters: { model: 'deepseek-chat', ...OPENAI_KEY },
++  },
++  {
++    name: 'xai',
++    provider: Providers.XAI,
++    format: 'openai',
++    modelParameters: { model: 'grok-4', ...OPENAI_KEY },
++  },
++  {
++    name: 'moonshot',
++    provider: Providers.MOONSHOT,
++    format: 'openai',
++    modelParameters: { model: 'kimi-k2', ...OPENAI_KEY },
++  },
++];
++
++function parseRequest(format: RequestFormat, body: Record<string, unknown>): Captured {
++  if (format === 'google') {
++    return {
++      system: body.systemInstruction,
++      tools: body.tools,
++      messages: body.contents as unknown[],
++    };
++  }
++  if (format === 'anthropic') {
++    return { system: body.system, tools: body.tools, messages: body.messages as unknown[] };
++  }
++  const messages = (body.messages ?? []) as Array<{ role: string }>;
++  return {
++    system: messages.filter((message) => message.role === 'system'),
++    tools: body.tools,
++    messages: messages.filter((message) => message.role !== 'system'),
++  };
++}
++
++export interface CaptureOptions {
++  providerCase: ProviderCase;
++  agent: Record<string, unknown>;
++  messages: BaseMessage[];
++  /** Response body for the request at this position; undefined aborts the run there. */
++  respond?: (index: number, request: Captured) => unknown;
++  customHandlers?: Record<string, unknown>;
++  /** The summary `formatAgentMessages` took from the history. */
++  initialSummary?: { text: string; tokenCount: number };
++}
++
++/** Runs the turn and returns every provider request it made, in order. */
++export async function captureRun({
++  providerCase,
++  agent: agentInput,
++  messages,
++  respond,
++  customHandlers,
++  initialSummary,
++}: CaptureOptions): Promise<Captured[]> {
++  const requests: Captured[] = [];
++  const agent = {
++    ...agentInput,
++    provider: providerCase.provider,
++    endpoint: providerCase.endpoint ?? providerCase.provider,
++    model_parameters: { ...providerCase.modelParameters },
++  } as Record<string, unknown> & { model_parameters: Record<string, unknown> };
++
++  const answer = (request: Captured): unknown => {
++    requests.push(request);
++    const response = respond?.(requests.length - 1, request);
++    if (response === undefined) {
++      throw new Error(CAPTURED);
++    }
++    return response;
++  };
++
++  const fetchMock = jest.spyOn(global, 'fetch').mockImplementation(async (input, init) => {
++    const request = input instanceof Request ? input : undefined;
++    const raw = request ? await request.clone().text() : String(init?.body ?? '{}');
++    const response = answer(parseRequest(providerCase.format, JSON.parse(raw)));
++    return new Response(JSON.stringify(response), {
++      status: 200,
++      headers: { 'content-type': 'application/json' },
++    });
++  });
++  if (providerCase.format === 'bedrock') {
++    agent.model_parameters.client = {
++      send: async (command: { input: Record<string, unknown> }) =>
++        answer({
++          system: command.input.system,
++          tools: command.input.toolConfig,
++          messages: command.input.messages as unknown[],
++        }),
++      config: {},
++      destroy: () => undefined,
++      middlewareStack: { add: () => undefined, use: () => undefined },
++    };
++  }
++
++  try {
++    const runId = `capture-${providerCase.name}-${Math.random()}`;
++    const run = await createRun({
++      appConfig: { endpoints: { agents: { promptCache: { stableContext: true } } } } as never,
++      agents: [agent] as never,
++      messages,
++      runId,
++      signal: new AbortController().signal,
++      streaming: false,
++      streamUsage: false,
++      ...(initialSummary ? { initialSummary } : {}),
++      ...(customHandlers ? { customHandlers: customHandlers as never } : {}),
++    });
++    await run
++      .processStream({ messages }, { configurable: { thread_id: runId }, version: 'v2' })
++      .catch(() => undefined);
++  } finally {
++    fetchMock.mockRestore();
++  }
++  if (requests.length === 0) {
++    throw new Error(`No request captured for ${providerCase.name}`);
++  }
++  return requests;
++}
++
++function isCachePointBlock(value: unknown): boolean {
++  return (
++    value != null &&
++    typeof value === 'object' &&
++    Object.keys(value).length === 1 &&
++    'cachePoint' in value
++  );
++}
++
++/** Cache markers move to the newest messages every turn; they are not prompt content. */
++export function stripCacheMarkers(value: unknown): unknown {
++  if (Array.isArray(value)) {
++    return value.filter((item) => !isCachePointBlock(item)).map(stripCacheMarkers);
++  }
++  if (value != null && typeof value === 'object') {
++    return Object.fromEntries(
++      Object.entries(value)
++        .filter(([key]) => key !== 'cache_control')
++        .map(([key, nested]) => [key, stripCacheMarkers(nested)]),
++    );
++  }
++  return value;
++}
++
++export const serialize = (value: unknown): string => JSON.stringify(stripCacheMarkers(value));
+diff --git a/packages/api/src/agents/__tests__/initialize.test.ts b/packages/api/src/agents/__tests__/initialize.test.ts
+index e7afbb2cb..2193e4769 100644
+--- a/packages/api/src/agents/__tests__/initialize.test.ts
++++ b/packages/api/src/agents/__tests__/initialize.test.ts
+@@ -139,7 +139,6 @@ jest.mock('../../middleware/modelBoundContent', () => {
+ });
+ 
+ import { initializeAgent } from '../initialize';
+-import { applyContextToAgent } from '../context';
+ import { primeResources } from '../resources';
+ import { isFatalAgentInitializationError } from '../errors';
+ import { canAgentGraphPause } from '../hitl/admission';
+@@ -600,69 +599,6 @@ describe('initializeAgent: ChatProject context', () => {
+     };
+   }
+ 
+-  /** Inline snapshot recorded on upstream/dev 6718244d8, where the run context was one string. */
+-  it('builds the system prompt fields exactly as upstream without stableContext', async () => {
+-    const { generateArtifactsPrompt } = jest.requireMock('~/prompts') as {
+-      generateArtifactsPrompt: jest.Mock;
+-    };
+-    generateArtifactsPrompt.mockReturnValueOnce('Artifact guidance\n');
+-    const { agent, loadTools, db } = createMocks();
+-    agent.instructions = 'Today is {{current_date}}.\n';
+-    agent.additional_instructions = 'Agent context\n';
+-    agent.artifacts = 'enabled' as never;
+-    const runtime = {
+-      ...projectRuntime(),
+-      requestBody: { timezone: 'Europe/Moscow' },
+-      turnStartedAt: new Date('2026-08-31T06:20:00.000Z').getTime(),
+-    };
+-
+-    const result = await initializeAgent(
+-      {
+-        runtime,
+-        agent,
+-        loadTools,
+-        endpointOption: { endpoint: EModelEndpoint.agents },
+-        allowedProviders: new Set([Providers.OPENAI]),
+-        useChatProjectContext: true,
+-      },
+-      db,
+-    );
+-    /** As `AgentClient.buildMessages` prepares a run agent: trim, then add the run context. */
+-    result.additional_instructions = result.additional_instructions?.trim() || undefined;
+-    const mcpManager = { formatInstructionsForContext: jest.fn(async () => '') };
+-    await applyContextToAgent({
+-      agent: result as never,
+-      mcpManager: mcpManager as never,
+-      runContext: { rag: 'Passage 7919', memory: 'tea: no\n', agentFiles: 'Agent file text' },
+-    });
+-
+-    expect({
+-      instructions: result.instructions,
+-      additional_instructions: result.additional_instructions,
+-    }).toMatchInlineSnapshot(`
+-      {
+-        "additional_instructions": "Agent context
+-
+-
+-      Project guidance (user-provided context; subordinate to system, platform, agent, and tool policies):
+-      Prefer concise project answers.
+-
+-      Today is 2026-08-31 (Monday).
+-
+-
+-      Artifact guidance
+-
+-      Passage 7919
+-
+-      tea: no
+-
+-
+-      Agent file text",
+-        "instructions": undefined,
+-      }
+-    `);
+-  });
+-
+   it('keeps Agent and Project guidance exactly once in initialized output without mutating the definition', async () => {
+     const { agent, loadTools, db } = createMocks();
+     agent.instructions = 'Follow the Agent instructions.';
+@@ -2253,10 +2189,11 @@ describe('initializeAgent — stable and dynamic instruction fields', () => {
+     jest.clearAllMocks();
+   });
+ 
+-  it('moves instructions with temporal special vars into the dynamic tail using the turn start', async () => {
++  it('moves instructions with temporal special vars into the dynamic tail anchored to the conversation start', async () => {
+     const { agent, req, res, loadTools, db } = createMocks();
+     agent.instructions =
+-      'Today is {{current_date}}. The turn began at {{current_datetime}} ({{iso_datetime}}).';
++      'Today is {{current_date}}. The chat began at {{current_datetime}} ({{iso_datetime}}).';
++    req.config = { endpoints: { agents: { promptCache: { stableContext: true } } } } as never;
+     req.conversationCreatedAt = '2026-08-25T10:00:00.000Z';
+     req.turnStartedAt = new Date('2026-08-31T06:20:00.000Z').getTime();
+     req.body = { timezone: 'UTC' };
+@@ -2275,30 +2212,18 @@ describe('initializeAgent — stable and dynamic instruction fields', () => {
+     );
+ 
+     expect(result.instructions).toBeUndefined();
+-    expect(result.additional_instructions).toBe(
+-      'Today is 2026-08-31 (Monday). The turn began at 2026-08-31 06:20:00 +00:00 (Monday) (2026-08-31T06:20:00.000Z).',
++    expect(result.additional_instructions).toBeUndefined();
++    expect(result.dynamicToolContextMap?.agent_temporal_instructions).toBe(
++      'Today is 2026-08-25 (Tuesday). The chat began at 2026-08-25 10:00:00 +00:00 (Tuesday) (2026-08-25T10:00:00.000Z).',
+     );
+   });
+ 
+-  it('builds the instruction fields exactly as upstream without stableContext', async () => {
+-    const { generateArtifactsPrompt } = jest.requireMock('~/prompts') as {
+-      generateArtifactsPrompt: jest.Mock;
+-    };
+-    generateArtifactsPrompt.mockReturnValueOnce('Artifact guidance');
++  it('resolves temporal special vars in the request timezone, from the turn start without a conversation anchor', async () => {
+     const { agent, req, res, loadTools, db } = createMocks();
+-    loadTools.mockResolvedValueOnce({
+-      tools: [],
+-      toolContextMap: { web_search: 'Web search instructions' },
+-      dynamicToolContextMap: { web_search: 'Conversation Date & Time: turn' },
+-      toolDefinitions: [],
+-      hasDeferredTools: false,
+-    });
+-    agent.instructions = 'Today is {{current_date}}, at {{current_datetime}}.';
+-    agent.additional_instructions = 'Agent context';
+-    agent.artifacts = 'enabled' as never;
+-    req.conversationCreatedAt = '2026-08-25T10:00:00.000Z';
+-    req.turnStartedAt = new Date('2026-08-31T06:20:00.000Z').getTime();
+-    req.body = { timezone: 'Europe/Moscow' };
++    agent.instructions = 'It is currently {{current_datetime}}.';
++    req.config = { endpoints: { agents: { promptCache: { stableContext: true } } } } as never;
++    req.turnStartedAt = new Date('2024-01-15T18:30:00.000Z').getTime();
++    req.body = { timezone: 'America/New_York' };
+ 
+     const result = await initializeAgent(
+       {
+@@ -2313,35 +2238,32 @@ describe('initializeAgent — stable and dynamic instruction fields', () => {
+       db,
+     );
+ 
+-    expect({
+-      instructions: result.instructions,
+-      additional_instructions: result.additional_instructions,
+-      toolContextMap: result.toolContextMap,
+-      dynamicToolContextMap: result.dynamicToolContextMap,
+-    }).toMatchInlineSnapshot(`
+-      {
+-        "additional_instructions": "Agent context
+-
+-      Today is 2026-08-31 (Monday), at 2026-08-31 09:20:00 +03:00 (Monday).
+-
+-      Artifact guidance",
+-        "dynamicToolContextMap": {
+-          "web_search": "Conversation Date & Time: turn",
+-        },
+-        "instructions": undefined,
+-        "toolContextMap": {
+-          "web_search": "Web search instructions",
+-        },
+-      }
+-    `);
++    expect(result.instructions).toBeUndefined();
++    expect(result.additional_instructions).toBeUndefined();
++    expect(result.dynamicToolContextMap?.agent_temporal_instructions).toBe(
++      'It is currently 2024-01-15 13:30:00 -05:00 (Monday).',
++    );
+   });
+ 
+-  it('anchors temporal special vars to the conversation start with stableContext', async () => {
++  it('keeps artifact guidance before all per-turn context without mutating shared tool context', async () => {
++    const { generateArtifactsPrompt } = jest.requireMock('~/prompts') as {
++      generateArtifactsPrompt: jest.Mock;
++    };
++    generateArtifactsPrompt.mockReturnValue('Artifact guidance');
++
+     const { agent, req, res, loadTools, db } = createMocks();
++    const webContext = { web_search: 'Conversation Date & Time: 2026-08-31T06:20:00.000Z' };
++    loadTools.mockResolvedValueOnce({
++      tools: [],
++      toolContextMap: {},
++      dynamicToolContextMap: webContext,
++      toolDefinitions: [],
++      hasDeferredTools: false,
++    });
++    agent.additional_instructions = 'Stable agent context';
+     agent.instructions = 'Today is {{current_date}}.';
+-    agent.additional_instructions = 'Agent context';
++    agent.artifacts = 'enabled' as never;
+     req.config = { endpoints: { agents: { promptCache: { stableContext: true } } } } as never;
+-    req.conversationCreatedAt = '2026-08-25T10:00:00.000Z';
+     req.turnStartedAt = new Date('2026-08-31T06:20:00.000Z').getTime();
+     req.body = { timezone: 'UTC' };
+ 
+@@ -2358,18 +2280,23 @@ describe('initializeAgent — stable and dynamic instruction fields', () => {
+       db,
+     );
+ 
+-    expect(result.instructions).toBeUndefined();
+-    expect(result.additional_instructions).toBe('Agent context');
++    expect(result.additional_instructions).toBe('Stable agent context\n\nArtifact guidance');
+     expect(result.dynamicToolContextMap).toEqual({
+-      agent_temporal_instructions: 'Today is 2026-08-25 (Tuesday).',
++      ...webContext,
++      agent_temporal_instructions: 'Today is 2026-08-31 (Monday).',
++    });
++    expect(webContext).toEqual({
++      web_search: 'Conversation Date & Time: 2026-08-31T06:20:00.000Z',
+     });
+   });
+ 
+-  it('resolves temporal special vars in the request timezone', async () => {
++  it('keeps temporal instructions in additional_instructions, dated by the turn start, when stableContext is off', async () => {
+     const { agent, req, res, loadTools, db } = createMocks();
+-    agent.instructions = 'It is currently {{current_datetime}}.';
+-    req.turnStartedAt = new Date('2024-01-15T18:30:00.000Z').getTime();
+-    req.body = { timezone: 'America/New_York' };
++    agent.instructions =
++      'Today is {{current_date}}. The turn began at {{current_datetime}} ({{iso_datetime}}).';
++    req.conversationCreatedAt = '2026-08-25T10:00:00.000Z';
++    req.turnStartedAt = new Date('2026-08-31T06:20:00.000Z').getTime();
++    req.body = { timezone: 'UTC' };
+ 
+     const result = await initializeAgent(
+       {
+@@ -2386,8 +2313,9 @@ describe('initializeAgent — stable and dynamic instruction fields', () => {
+ 
+     expect(result.instructions).toBeUndefined();
+     expect(result.additional_instructions).toBe(
+-      'It is currently 2024-01-15 13:30:00 -05:00 (Monday).',
++      'Today is 2026-08-31 (Monday). The turn began at 2026-08-31 06:20:00 +00:00 (Monday) (2026-08-31T06:20:00.000Z).',
+     );
++    expect(result.dynamicToolContextMap?.agent_temporal_instructions).toBeUndefined();
+   });
+ 
+   it('keeps non-temporal special vars in stable instructions', async () => {
+diff --git a/packages/api/src/agents/__tests__/promptPrefixStability.test.ts b/packages/api/src/agents/__tests__/promptPrefixStability.test.ts
+index b89013f2a..205084b80 100644
+--- a/packages/api/src/agents/__tests__/promptPrefixStability.test.ts
++++ b/packages/api/src/agents/__tests__/promptPrefixStability.test.ts
+@@ -26,19 +26,19 @@
+  * the system prompt every turn and uncache the whole history.
+  *
+  * The history goes through the same helpers `AgentClient.buildMessages` uses
+- * (`planTurnContext` and `buildHistoryContextUpdates`), and the per-chat
++ * (`planTurnContext` and `createHistoryContextUpdates`), and the per-chat
+  * system context through the same builders as agent initialization, so a
+  * change to any of them that moves bytes inside a cached prefix fails here.
+  */
+ import { tool } from '@langchain/core/tools';
+-import { replaceSpecialVars } from 'librechat-data-provider';
+ import { formatAgentMessages, formatMessage, Providers } from '@librechat/agents';
+-import type { ContextEntry, TurnContextMessage } from '../turnContext';
+-import { buildHistoryContextUpdates, AGENT_TEMPORAL_INSTRUCTIONS_KEY } from '../contextUpdates';
++import { replaceSpecialVars } from 'librechat-data-provider';
+ import { buildWebSearchContext, buildWebSearchDynamicContext } from '~/tools/toolkits/web';
+-import { ContextPartKeys, contributeContext } from '../systemParts';
+-import { planTurnContext } from '../turnContext';
++import type { ContextEntry, TurnContextMessage } from '../turnContext';
++import { createHistoryContextUpdates, AGENT_TEMPORAL_INSTRUCTIONS_KEY } from '../contextUpdates';
+ import { prependContextText } from '../client';
++import { planTurnContext } from '../turnContext';
++import { ContextPartKeys, contributeContext } from '../systemParts';
+ import { createRun } from '../run';
+ 
+ jest.setTimeout(30000);
+@@ -127,16 +127,16 @@ function buildHistory(
+     }
+   }
+   if (!stableContext) {
+-    updates = buildHistoryContextUpdates({
++    updates = createHistoryContextUpdates({
+       req: {
+         conversationCreatedAt: conversation.startedAt,
+-        turnStartedAt: Date.parse(conversation.turnStarts[turn - 1]),
++        turnStartedAt: conversation.turnStarts[turn - 1],
+         body: { timezone: TIMEZONE },
+         config: appConfigFor(false, includeTimestamps),
+       },
+       messages: rows,
+       agents: [{ dynamicToolContextMap: { web_search: 'stated' } }],
+-    });
++    }).updates;
+   }
+   const formatted = rows.map((message, index) => {
+     const formattedMessage = formatMessage({ message: message as never });
+@@ -155,7 +155,7 @@ type ProviderCase = {
+ 
+ type Captured = { system: unknown; tools: unknown; messages: unknown[] };
+ 
+-const RUNTIME_CONTEXT_MARKER = 'Conversation Date & Time:';
++const RUNTIME_CONTEXT_MARKER = 'Conversation started:';
+ const STATIC_ADDITIONAL = 'Answer in the language of the user.';
+ const QUEUED_CONTEXT = 'report.csv';
+ 
+@@ -259,9 +259,14 @@ async function captureTurn(
+     instructions: 'You are a careful support assistant.',
+     ...tail,
+     ...(variant.queuedAtTurn ? queuedFileState(variant.queuedAtTurn === turn) : {}),
+-    toolContextMap: { web_search: buildWebSearchContext() },
++    toolContextMap: { web_search: buildWebSearchContext(stableContext) },
+     dynamicToolContextMap: {
+-      web_search: buildWebSearchDynamicContext(now),
++      web_search: buildWebSearchDynamicContext({
++        turnStartedAt: now,
++        conversationStartedAt: now,
++        timezone: TIMEZONE,
++        stableContext,
++      }),
+       [AGENT_TEMPORAL_INSTRUCTIONS_KEY]: replaceSpecialVars({
+         text: 'Today is {{current_date}}.',
+         now,
+@@ -432,7 +437,7 @@ describe('prompt prefix stability', () => {
+           expect(JSON.stringify(turn.messages)).not.toContain(RUNTIME_CONTEXT_MARKER);
+         }
+         expect(JSON.stringify(turns[0])).toContain(
+-          `${RUNTIME_CONTEXT_MARKER} 2026-03-09T20:00:00.000Z`,
++          `${RUNTIME_CONTEXT_MARKER} 2026-03-09 23:00 +03:00 (Mon)`,
+         );
+       });
+ 
+@@ -449,7 +454,7 @@ describe('prompt prefix stability', () => {
+           JSON.stringify(captured.messages[captured.messages.length - 1]);
+         expect(lastUserText(turns[0])).not.toContain('<context_update>');
+         expect(lastUserText(turns[1])).not.toContain('<context_update>');
+-        expect(lastUserText(turns[2])).toContain('Current date changed to: 2026-03-10 (Tuesday)');
++        expect(lastUserText(turns[2])).toContain('Current date changed to: 2026-03-10 (Tue)');
+       });
+ 
+       it('shares tools and the static system prefix with another conversation', () => {
+@@ -483,10 +488,10 @@ describe('prompt prefix stability', () => {
+       );
+     }
+     expect(JSON.stringify(turns[2].messages)).toContain(
+-      'Message sent: 2026-03-09 23:30:00 +03:00 (Monday)',
++      'Message sent: 2026-03-09 23:30:00 +03:00 (Mon)',
+     );
+     expect(JSON.stringify(turns[2].messages[4])).toContain(
+-      'Current date changed to: 2026-03-10 (Tuesday)\\nMessage sent: 2026-03-10 00:30:00 +03:00 (Tuesday)',
++      'Current date changed to: 2026-03-10 (Tue)\\nMessage sent: 2026-03-10 00:30:00 +03:00 (Tue)',
+     );
+   });
+ });
+@@ -497,9 +502,6 @@ const MOVES_TAIL = PROVIDERS.filter(
+     name.includes('openrouter with') ||
+     name.includes('Anthropic protocol'),
+ );
+-/** Bedrock merges like the providers that move the tail; where the per-turn part then goes
+- *  depends on the SDK release (agents#613 moves it behind the history), so no test pins it. */
+-const MERGES_ONLY = PROVIDERS.filter(({ provider }) => provider === Providers.BEDROCK);
+ 
+ async function playConversation(providerCase: ProviderCase, variant: AgentVariant) {
+   const turns: Captured[] = [];
+@@ -538,9 +540,6 @@ describe('per-turn context in additional_instructions', () => {
+         });
+       });
+ 
+-      if (MERGES_ONLY.includes(providerCase)) {
+-        return;
+-      }
+       if (!movesTail) {
+         it('keeps the memory and RAG context in the system prompt', () => {
+           turns.forEach((turn, index) => {
+@@ -595,6 +594,24 @@ describe('per-turn context in additional_instructions', () => {
+     },
+   );
+ 
++  describe.each(MOVES_TAIL.map((providerCase) => [providerCase.name, providerCase] as const))(
++    '%s: regression guard',
++    (_name, providerCase) => {
++      it('a per-turn part merged into the stable instructions changes the system prompt every turn', async () => {
++        /** Without per-turn parts, memory and RAG context cannot be told apart and are merged. */
++        const turns = await playConversation(providerCase, { rag: true, memory: true });
++        expect(JSON.stringify(turns[1].system)).not.toBe(JSON.stringify(turns[0].system));
++        expect(JSON.stringify(turns[2].system)).not.toBe(JSON.stringify(turns[1].system));
++      });
++
++      it('a runtime context dated by the turn start changes the system prompt every turn', async () => {
++        const turns = await playConversation(providerCase, { perTurnClock: true });
++        expect(JSON.stringify(turns[1].system)).not.toBe(JSON.stringify(turns[0].system));
++        expect(JSON.stringify(turns[2].system)).not.toBe(JSON.stringify(turns[1].system));
++      });
++    },
++  );
++
+   describe.each(MOVES_TAIL.map((providerCase) => [providerCase.name, providerCase] as const))(
+     '%s: one-turn queued file context',
+     (_name, providerCase) => {
+@@ -617,11 +634,12 @@ describe('stableContext off', () => {
+     (_name, providerCase) => {
+       it('dates the runtime context by each turn and announces nothing in the history', async () => {
+         const turns = await playConversation(providerCase, { stableContext: false });
+-        turns.forEach((turn, i) => {
++        for (const turn of turns) {
+           const request = JSON.stringify([turn.system, turn.messages]);
+-          expect(request).toContain(`${RUNTIME_CONTEXT_MARKER} ${CONVERSATION_A.turnStarts[i]}`);
++          expect(request).toContain('Conversation Date & Time:');
++          expect(request).not.toContain(RUNTIME_CONTEXT_MARKER);
+           expect(JSON.stringify(turn.messages)).not.toContain('<context_update>');
+-        });
++        }
+         const stamps = turns.map(
+           (turn) =>
+             /Conversation Date & Time: ([^"\\]+)/.exec(
+diff --git a/packages/api/src/agents/__tests__/run-summarization.test.ts b/packages/api/src/agents/__tests__/run-summarization.test.ts
+index 4115928e0..538473f0d 100644
+--- a/packages/api/src/agents/__tests__/run-summarization.test.ts
++++ b/packages/api/src/agents/__tests__/run-summarization.test.ts
+@@ -10,12 +10,7 @@ import {
+   MAX_SUBAGENT_DEPTH,
+   MAX_SUBAGENT_RUN_CONFIGS,
+ } from 'librechat-data-provider';
+-import type {
+-  CompactionSemanticIndex,
+-  SubagentTaskConfig,
+-  SubagentConfig,
+-  AgentInputs,
+-} from '@librechat/agents';
++import type { CompactionSemanticIndex, SubagentTaskConfig, AgentInputs } from '@librechat/agents';
+ import type { AppConfig, ConfigOverrideLayer, IUser } from '@librechat/data-schemas';
+ import type { SummarizationConfig, TEndpoint } from 'librechat-data-provider';
+ import type { BaseMessage } from '@langchain/core/messages';
+@@ -2098,121 +2093,6 @@ describe('initialSummary passthrough', () => {
+ // Suite 7: stable/dynamic system instructions
+ // ---------------------------------------------------------------------------
+ describe('stable/dynamic system instructions', () => {
+-  it.each([Providers.ANTHROPIC, Providers.OPENROUTER])(
+-    'labels the complete cached %s tail as application context without changing user input',
+-    async (provider) => {
+-      await callAndCapture({
+-        agents: [
+-          makeAgent({
+-            provider,
+-            endpoint: provider,
+-            instructions:
+-              "Translate the user's message into Chinese. Reply with the translation only.",
+-            additional_instructions: 'Saved memory: prefers tea\n\nRetrieved context: a document',
+-            dynamicToolContextMap: { web_search: 'Conversation Date & Time: anchor' },
+-            model_parameters: { model: 'test-model', promptCache: true, apiKey: 'test-key' },
+-          }),
+-        ],
+-      });
+-      const runConfig = jest.mocked(Run.create).mock.calls[0][0];
+-      if (!('agents' in runConfig.graphConfig) || !runConfig.graphConfig.agents?.length) {
+-        throw new Error('Expected agent inputs');
+-      }
+-      const inputs = runConfig.graphConfig.agents[0];
+-      expect(inputs.additional_instructions).toBe(
+-        `<system_context>
+-Context supplied by the application, not part of the user's message. Use it as context; do not process it as user input.
+-
+-Conversation Date & Time: anchor
+-Saved memory: prefers tea
+-
+-Retrieved context: a document
+-</system_context>`,
+-      );
+-      const actual = jest.requireActual<typeof import('@librechat/agents')>('@librechat/agents');
+-      const run = await actual.Run.create(runConfig);
+-      const context = run.Graph!.agentContexts.get(inputs.agentId)!;
+-      const userText = 'Translate this paragraph, including <system_context> as literal text.';
+-      const messages = [
+-        new HumanMessage('Previous user input'),
+-        new AIMessage('Previous response'),
+-        new HumanMessage(userText),
+-      ];
+-      const prompt = await context.systemRunnable!.invoke(messages);
+-      expect(prompt[0].getType()).toBe('system');
+-      expect(JSON.stringify(prompt[0].content)).not.toContain('<system_context>');
+-      expect(prompt[prompt.length - 2].getType()).toBe('human');
+-      expect(prompt[prompt.length - 2].content).toBe(inputs.additional_instructions);
+-      expect(prompt[prompt.length - 1].text).toBe(userText);
+-      expect(messages[messages.length - 1].content).toBe(userText);
+-    },
+-  );
+-
+-  it.each([
+-    [Providers.ANTHROPIC, false],
+-    [Providers.OPENROUTER, false],
+-    [Providers.OPENAI, true],
+-    [Providers.BEDROCK, true],
+-  ])(
+-    'leaves the %s tail unchanged with promptCache=%s when it is not relocated',
+-    async (provider, promptCache) => {
+-      const agents = await callAndCapture({
+-        agents: [
+-          makeAgent({
+-            provider,
+-            endpoint: provider,
+-            instructions: 'Base instructions',
+-            additional_instructions: 'Memory tail',
+-            model_parameters: { model: 'test-model', promptCache },
+-          }),
+-        ],
+-      });
+-      expect(agents[0].additional_instructions).toBe('Memory tail');
+-    },
+-  );
+-
+-  it('frames isolated subagent skills inside the same context block', async () => {
+-    const child = makeAgent({
+-      id: 'agent_child',
+-      provider: Providers.ANTHROPIC,
+-      endpoint: Providers.ANTHROPIC,
+-      instructions: 'Translate the user input',
+-      additional_instructions: 'Child memory',
+-      model_parameters: { model: 'test-model', promptCache: true },
+-      alwaysApplySkillPrimes: [{ name: 'translation', body: 'Use the glossary.' }],
+-    });
+-    const agents = await callAndCapture({
+-      agents: [
+-        makeAgent({
+-          subagents: { enabled: true, allowSelf: false, agent_ids: [child.id] },
+-          subagentAgentConfigs: [child],
+-        }),
+-      ],
+-    });
+-    const configs = agents[0].subagentConfigs as SubagentConfig[];
+-    expect(configs[0].agentInputs?.additional_instructions).toContain(
+-      'Child memory\n\n# Always-apply skill: translation\nUse the glossary.\n</system_context>',
+-    );
+-    expect(
+-      configs[0].agentInputs?.additional_instructions?.match(/<system_context>/g),
+-    ).toHaveLength(1);
+-    expect(child.additional_instructions).toBe('Child memory');
+-  });
+-
+-  it('does not add a context carrier for an empty cached tail', async () => {
+-    const agents = await callAndCapture({
+-      agents: [
+-        makeAgent({
+-          provider: Providers.ANTHROPIC,
+-          endpoint: Providers.ANTHROPIC,
+-          instructions: 'Translate the user input',
+-          model_parameters: { model: 'test-model', promptCache: true },
+-        }),
+-      ],
+-    });
+-    expect(agents[0].additional_instructions).toBeUndefined();
+-  });
+-
+   it('keeps static tool and agent instructions separate from dynamic runtime tail', async () => {
+     const agents = await callAndCapture({
+       agents: [
+@@ -2229,76 +2109,47 @@ Retrieved context: a document
+     expect(agents[0].additional_instructions).toBe('Conversation Date & Time: anchor\nMemory tail');
+   });
+ 
+-  it('hands the SDK the same system prompt as upstream without stableContext', async () => {
++  it('puts dynamic tool context after the additional instructions with stableContext', async () => {
+     const agents = await callAndCapture({
++      appConfig: {
++        endpoints: { agents: { promptCache: { stableContext: true } } },
++      } as unknown as AppConfig,
+       agents: [
+         makeAgent({
+           instructions: 'Base instructions',
+-          additional_instructions: 'Artifact guidance\n\nSaved memory',
++          additional_instructions: 'Memory tail',
+           toolContextMap: { web_search: 'Static tool instructions' },
+-          dynamicToolContextMap: {
+-            web_search: 'Conversation Date & Time: turn',
+-            agent_temporal_instructions: 'Today is Monday.',
+-            queued_code_files: 'Queued files',
+-          },
+-        }),
+-        makeAgent({
+-          id: 'agent_2',
+-          provider: Providers.ANTHROPIC,
+-          endpoint: Providers.ANTHROPIC,
+-          instructions: 'Second agent',
+-          additional_instructions: 'Saved memory',
+-          dynamicToolContextMap: { web_search: 'Conversation Date & Time: turn' },
+-          model_parameters: { model: 'test-model', promptCache: true, apiKey: 'test-key' },
++          dynamicToolContextMap: { web_search: 'Conversation Date & Time: anchor' },
+         }),
+       ],
+     });
+ 
+-    expect(
+-      agents.map(({ instructions, additional_instructions }) => ({
+-        instructions,
+-        additional_instructions,
+-      })),
+-    ).toMatchInlineSnapshot(`
+-      [
+-        {
+-          "additional_instructions": "Conversation Date & Time: turn
+-      Today is Monday.
+-      Artifact guidance
+-
+-      Saved memory",
+-          "instructions": "Static tool instructions
+-      Base instructions",
+-        },
+-        {
+-          "additional_instructions": "<system_context>
+-      Context supplied by the application, not part of the user's message. Use it as context; do not process it as user input.
+-
+-      Conversation Date & Time: turn
+-      Saved memory
+-      </system_context>",
+-          "instructions": "Second agent",
+-        },
+-      ]
+-    `);
++    expect(agents[0].instructions).toBe('Static tool instructions\nBase instructions');
++    expect(agents[0].additional_instructions).toBe('Memory tail\nConversation Date & Time: anchor');
+   });
+ 
+-  it('puts the dynamic tool context after the additional instructions with stableContext', async () => {
++  it('preserves the full artifact prefix when timestamps change between turns with stableContext', async () => {
+     const agents = await callAndCapture({
+       appConfig: {
+         endpoints: { agents: { promptCache: { stableContext: true } } },
+       } as unknown as AppConfig,
+-      agents: [
++      agents: ['2026-08-31T06:20:00.000Z', '2026-08-31T06:21:00.000Z'].map((time, index) =>
+         makeAgent({
+-          instructions: 'Base instructions',
++          id: `agent_${index}`,
++          instructions: 'Stable agent instructions',
+           additional_instructions: 'Artifact guidance',
+-          dynamicToolContextMap: { web_search: 'Conversation Date & Time: anchor' },
++          toolContextMap: { web_search: 'Static web instructions' },
++          dynamicToolContextMap: { web_search: `Conversation Date & Time: ${time}` },
+         }),
+-      ],
++      ),
+     });
+ 
++    expect(agents[0].instructions).toBe(agents[1].instructions);
+     expect(agents[0].additional_instructions).toBe(
+-      'Artifact guidance\nConversation Date & Time: anchor',
++      'Artifact guidance\nConversation Date & Time: 2026-08-31T06:20:00.000Z',
++    );
++    expect(agents[1].additional_instructions).toBe(
++      'Artifact guidance\nConversation Date & Time: 2026-08-31T06:21:00.000Z',
+     );
+   });
+ });
+diff --git a/packages/api/src/agents/__tests__/systemParts.snapshot.test.ts b/packages/api/src/agents/__tests__/systemParts.snapshot.test.ts
+new file mode 100644
+index 000000000..8a470d677
+--- /dev/null
++++ b/packages/api/src/agents/__tests__/systemParts.snapshot.test.ts
+@@ -0,0 +1,488 @@
++/**
++ * Byte-identity guard for the assembled system prompt.
++ *
++ * Each case runs the real producers: `initializeAgent` (project, memory guard,
++ * artifacts, skills catalog, temporal instructions, tool context maps from
++ * `loadTools`), the request stage `AgentClient.buildMessages` applies through
++ * `applyContextToAgent` (RAG, memory, agent files, MCP), and `createRun`. It
++ * records the `instructions` and `additional_instructions` every graph agent
++ * receives.
++ *
++ * Cases run with `promptCache.stableContext` off, where the previous
++ * implementation is the oracle. The snapshot was written by this harness on the
++ * commit before structured system parts, where the producers concatenated
++ * strings, so any byte the refactor moves fails here. Long fixed texts (artifacts prompts, web search
++ * instructions, memory preamble) are replaced by placeholders after capture;
++ * placeholders only substitute exact occurrences, so separators around them
++ * are still compared byte for byte.
++ */
++jest.mock('winston', () => ({
++  createLogger: jest.fn(() => ({
++    debug: jest.fn(),
++    warn: jest.fn(),
++    error: jest.fn(),
++    info: jest.fn(),
++  })),
++  format: Object.assign(
++    jest.fn((fn) => () => ({ transform: fn })),
++    {
++      combine: jest.fn(),
++      colorize: jest.fn(),
++      simple: jest.fn(),
++      label: jest.fn(),
++      timestamp: jest.fn(),
++      printf: jest.fn(),
++      errors: jest.fn(),
++      splat: jest.fn(),
++      json: jest.fn(),
++    },
++  ),
++  addColors: jest.fn(),
++  transports: { Console: jest.fn(), DailyRotateFile: jest.fn(), File: jest.fn() },
++}));
++
++jest.mock('~/utils', () => ({
++  ...jest.requireActual('~/utils'),
++  extractLibreChatParams: jest.fn(() => ({ resendFiles: false, modelOptions: {} })),
++  getModelMaxTokens: jest.fn(() => 200000),
++}));
++
++jest.mock('~/endpoints', () => ({
++  getProviderConfig: jest.fn(({ provider }: { provider: string }) => ({
++    overrideProvider: provider,
++    getOptions: jest.fn(async () => ({ llmConfig: { model: 'test-model', maxTokens: 4096 } })),
++  })),
++}));
++
++jest.mock('~/files', () => ({
++  filterFilesByEndpointConfig: jest.fn(() => []),
++  filterFilesByEndpointRuntimeConfig: jest.fn(() => []),
++  isLegacyFileUploadUX: jest.fn(() => false),
++}));
++
++jest.mock('../resources', () => ({
++  primeResources: jest.fn().mockResolvedValue({ attachments: [], tool_resources: undefined }),
++}));
++
++import { Types } from 'mongoose';
++import { Run, Providers } from '@librechat/agents';
++import { EModelEndpoint, ArtifactModes, FileContext } from 'librechat-data-provider';
++import type { Agent, TFile } from 'librechat-data-provider';
++import type { InitializeAgentDbMethods } from '../initialize';
++import type { MCPManager } from '~/mcp/MCPManager';
++import { buildWebSearchContext, buildWebSearchDynamicContext } from '~/tools/toolkits/web';
++import { formatMemoryContext, memoryInstructions } from '../memory';
++import { generateArtifactsPrompt } from '~/prompts';
++import { applyContextToAgent } from '../context';
++import { initializeAgent } from '../initialize';
++import { createRun } from '../run';
++
++jest.setTimeout(30000);
++
++const TIMEZONE = 'Africa/Nairobi';
++const TURN_STARTED_AT = new Date('2026-03-09T20:30:00.000Z').getTime();
++const CONVERSATION_CREATED_AT = new Date('2026-03-09T20:00:00.000Z').getTime();
++const USER_ID = new Types.ObjectId();
++const SKILL_ID = new Types.ObjectId();
++
++type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
++
++/** Longest first: the shadcn artifacts prompt starts with the default one. */
++const PLACEHOLDERS: Array<[string, string]> = [
++  [
++    generateArtifactsPrompt({ endpoint: 'openAI', artifacts: ArtifactModes.DEFAULT }) ?? '',
++    '<artifacts:default>',
++  ] as [string, string],
++  ...(['openAI', EModelEndpoint.anthropic] as const).map((endpoint): [string, string] => [
++    generateArtifactsPrompt({ endpoint, artifacts: ArtifactModes.SHADCNUI }) ?? '',
++    `<artifacts:${ArtifactModes.SHADCNUI}:${endpoint}>`,
++  ]),
++  [buildWebSearchContext(true), '<web_search:instructions:stable>'] as [string, string],
++  [buildWebSearchContext(false), '<web_search:instructions>'] as [string, string],
++  [memoryInstructions, '<memory:instructions>'] as [string, string],
++].sort(([a], [b]) => b.length - a.length);
++
++function redact(value: unknown): Json {
++  if (typeof value === 'string') {
++    let text = value;
++    for (const [long, short] of PLACEHOLDERS) {
++      if (long !== '') {
++        text = text.split(long).join(short);
++      }
++    }
++    return text;
++  }
++  if (Array.isArray(value)) {
++    return value.map(redact);
++  }
++  if (value != null && typeof value === 'object') {
++    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, redact(item)]));
++  }
++  return (value ?? null) as Json;
++}
++
++interface AgentSetup {
++  id?: string;
++  provider?: string;
++  instructions?: string;
++  additional_instructions?: string;
++  artifacts?: string;
++  memoryTools?: boolean;
++  project?: string;
++  skills?: boolean;
++  webSearch?: boolean;
++  toolFiles?: boolean;
++  /** Request stage: what `AgentClient.buildMessages` adds. */
++  rag?: string;
++  memory?: string;
++  agentFiles?: string;
++  mcp?: string;
++  /** Uploads staged for this turn's code execution (`queued_code_files`). */
++  queuedFile?: boolean;
++  promptCache?: boolean;
++}
++
++const mcpManager = {
++  formatInstructionsForContext: jest.fn(
++    async () => '# MCP Server Instructions\n\n## docs\nUse docs.',
++  ),
++} as unknown as MCPManager;
++
++function createDb(): InitializeAgentDbMethods {
++  return {
++    getProjectFiles: jest.fn().mockResolvedValue([]),
++    getFiles: jest.fn().mockResolvedValue([]),
++    getConvoFiles: jest.fn().mockResolvedValue([]),
++    updateFilesUsage: jest.fn().mockResolvedValue([]),
++    getUserKey: jest.fn().mockResolvedValue('user-1'),
++    getUserKeyValues: jest.fn().mockResolvedValue([]),
++    getToolFilesByIds: jest.fn().mockResolvedValue([]),
++    listSkillsByAccess: jest.fn(async () => ({
++      skills: [
++        {
++          _id: SKILL_ID,
++          name: 'release-notes',
++          description: 'Drafts release notes from a changelog.',
++          author: USER_ID,
++        },
++      ],
++      has_more: false,
++      after: null,
++    })),
++  } as unknown as InitializeAgentDbMethods;
++}
++
++async function initialize(setup: AgentSetup, stableContext: boolean) {
++  const provider = setup.provider ?? Providers.OPENAI;
++  const agent = {
++    id: setup.id ?? 'agent_main',
++    name: setup.id ?? 'Main',
++    provider,
++    model: 'test-model',
++    model_parameters: { model: 'test-model' },
++    tools: setup.memoryTools ? ['memory'] : [],
++    instructions: setup.instructions,
++    additional_instructions: setup.additional_instructions,
++    artifacts: setup.artifacts,
++  } as unknown as Agent;
++  const toolContextMap: Record<string, string> = {};
++  const dynamicToolContextMap: Record<string, string> = {};
++  if (setup.webSearch) {
++    toolContextMap.web_search = buildWebSearchContext(stableContext);
++    dynamicToolContextMap.web_search = buildWebSearchDynamicContext({
++      turnStartedAt: TURN_STARTED_AT,
++      conversationStartedAt: CONVERSATION_CREATED_AT,
++      timezone: TIMEZONE,
++      stableContext,
++    });
++  }
++  if (setup.toolFiles) {
++    dynamicToolContextMap.execute_code =
++      '- Note: files are available in "/mnt/data/":\n\t- data.csv';
++    dynamicToolContextMap.file_search =
++      '- Note: Semantic search is available through:\n\t- report.pdf';
++    dynamicToolContextMap.image_edit_oai = '- Images available for image editing:\n\t- photo.png';
++  }
++  const loadTools = jest.fn(async () => ({
++    tools: [],
++    toolContextMap,
++    dynamicToolContextMap,
++    toolDefinitions: [],
++    hasDeferredTools: false,
++  }));
++  const runtime = {
++    user: { id: USER_ID.toString() },
++    appConfig: { endpoints: { [EModelEndpoint.agents]: { promptCache: { stableContext } } } },
++    requestBody: { timezone: TIMEZONE },
++    turnStartedAt: TURN_STARTED_AT,
++    conversationCreatedAt: CONVERSATION_CREATED_AT,
++    ...(setup.project != null
++      ? {
++          chatProjectContext: {
++            projectId: 'project-1',
++            contextRevision: 1,
++            instructions: setup.project,
++            file_ids: [],
++            resources: [],
++          },
++        }
++      : {}),
++  };
++  return initializeAgent(
++    {
++      runtime: runtime as never,
++      agent,
++      loadTools: loadTools as never,
++      endpointOption: { endpoint: EModelEndpoint.agents },
++      allowedProviders: new Set([provider]),
++      isInitialAgent: true,
++      useChatProjectContext: setup.project != null,
++      memoryAvailable: setup.memoryTools === true,
++      ...(setup.skills
++        ? { accessibleSkillIds: [SKILL_ID], skillStates: { [SKILL_ID.toString()]: true } }
++        : {}),
++    } as never,
++    createDb(),
++  );
++}
++
++/** Mirrors `prepareRuntimeAgent` in `AgentClient.buildMessages`. */
++async function applyRequestContext(agent: Agent, setup: AgentSetup) {
++  agent.instructions = agent.instructions?.trim() || undefined;
++  agent.additional_instructions = agent.additional_instructions?.trim() || undefined;
++  await applyContextToAgent({
++    agent,
++    mcpManager,
++    runContext: {
++      rag: setup.rag,
++      memory: formatMemoryContext(setup.memory),
++      agentFiles: setup.agentFiles,
++    },
++    ephemeralAgent: setup.mcp ? ({ mcp: [setup.mcp] } as never) : undefined,
++  });
++}
++
++const QUEUED_FILE: TFile = {
++  file_id: 'uploaded',
++  filename: 'data.csv',
++  filepath: '/uploads/data.csv',
++  type: 'text/csv',
++  user: 'user-1',
++  object: 'file',
++  bytes: 10,
++  embedded: false,
++  usage: 0,
++  context: FileContext.message_attachment,
++};
++
++async function prepareAgent(setup: AgentSetup, stableContext: boolean) {
++  const agent = (await initialize(setup, stableContext)) as unknown as Record<string, unknown>;
++  await applyRequestContext(agent as unknown as Agent, setup);
++  if (setup.queuedFile) {
++    agent.fileConsumers = { executeCode: true, fileSearch: false };
++    agent.provisionState = {
++      codeEnvFiles: [{ ...QUEUED_FILE }],
++      vectorDBFiles: [],
++      aliveFileIds: new Set(),
++      agentScopedFileIds: new Set(),
++    };
++  }
++  if (setup.promptCache) {
++    agent.model_parameters = { ...(agent.model_parameters as object), promptCache: true };
++  }
++  return agent;
++}
++
++interface GraphInput {
++  agentId?: string;
++  instructions?: string;
++  additional_instructions?: string;
++  subagentConfigs?: Array<{ type?: string; agentInputs?: GraphInput }>;
++}
++
++async function captureGraphInputs(agents: Array<Record<string, unknown>>, stableContext: boolean) {
++  const runSpy = jest.spyOn(Run, 'create').mockResolvedValue({} as never);
++  try {
++    await createRun({
++      appConfig: { endpoints: { agents: { promptCache: { stableContext } } } } as never,
++      agents: agents as never,
++      messages: [],
++      runId: 'run-snapshot',
++      signal: new AbortController().signal,
++      streaming: false,
++      streamUsage: false,
++    });
++    const graphAgents = (runSpy.mock.calls[0][0] as { graphConfig: { agents: GraphInput[] } })
++      .graphConfig.agents;
++    const project = (input: GraphInput): Json =>
++      redact({
++        agentId: input.agentId,
++        instructions: input.instructions,
++        additional_instructions: input.additional_instructions,
++        subagents: (input.subagentConfigs ?? [])
++          .filter((config) => config.agentInputs != null)
++          .map((config) => project(config.agentInputs as GraphInput)),
++      });
++    return graphAgents.map(project);
++  } finally {
++    runSpy.mockRestore();
++  }
++}
++
++const EVERYTHING: AgentSetup = {
++  instructions: 'Base. Today is {{current_date}}.',
++  additional_instructions: 'Agent dynamic guidance.',
++  artifacts: ArtifactModes.DEFAULT,
++  memoryTools: true,
++  project: 'Use metric units.',
++  skills: true,
++  webSearch: true,
++  toolFiles: true,
++  rag: 'Retrieved context: passage 7919',
++  memory: 'favorite_color: blue',
++  agentFiles: 'Attached file context:\nquarterly.txt: revenue up',
++  mcp: 'docs',
++  queuedFile: true,
++};
++
++const CASES: Record<string, AgentSetup | AgentSetup[]> = {
++  bare: { instructions: 'You are a careful support assistant.' },
++  'own additional instructions with surrounding whitespace': {
++    instructions: 'Base.',
++    additional_instructions: '  Agent dynamic guidance.\n',
++    memory: 'favorite_color: blue',
++  },
++  'artifacts default': { instructions: 'Base.', artifacts: ArtifactModes.DEFAULT },
++  'artifacts shadcn on anthropic': {
++    provider: Providers.ANTHROPIC,
++    instructions: 'Base.',
++    artifacts: ArtifactModes.SHADCNUI,
++  },
++  'memory tools and memory': {
++    instructions: 'Base.',
++    memoryTools: true,
++    memory: 'favorite_color: blue\n',
++  },
++  'project with trailing newline and memory': {
++    instructions: 'Base.',
++    project: 'Use metric units.\n',
++    memory: 'favorite_color: blue',
++  },
++  'project only': { project: 'Use metric units.' },
++  'skills catalog': { instructions: 'Base.', skills: true },
++  'web search': { instructions: 'Base.', webSearch: true },
++  'code, file search and image tools': { instructions: 'Base.', toolFiles: true },
++  'temporal instructions': { instructions: 'Today is {{current_date}}. Be brief.' },
++  'rag with surrounding whitespace': {
++    instructions: 'Base.',
++    artifacts: ArtifactModes.DEFAULT,
++    rag: '\nRetrieved context:\n- passage 7919\n',
++  },
++  'agent files only': { agentFiles: 'Attached file context:\nquarterly.txt: revenue up' },
++  'everything with MCP': EVERYTHING,
++  'anthropic promptCache: everything': {
++    ...EVERYTHING,
++    provider: Providers.ANTHROPIC,
++    promptCache: true,
++  },
++  'openrouter promptCache: memory, RAG and agent files': {
++    provider: Providers.OPENROUTER,
++    promptCache: true,
++    instructions: 'Base.',
++    artifacts: ArtifactModes.DEFAULT,
++    rag: '\nRetrieved context:\n- passage 7919\n',
++    memory: 'favorite_color: blue\n',
++    agentFiles: 'Attached file context:\nquarterly.txt: revenue up',
++  },
++  'anthropic promptCache: stable parts only': {
++    provider: Providers.ANTHROPIC,
++    promptCache: true,
++    instructions: 'Base.',
++    project: 'Use metric units.\n',
++    artifacts: ArtifactModes.DEFAULT,
++    webSearch: true,
++  },
++  'anthropic promptCache: per-turn parts only': {
++    provider: Providers.ANTHROPIC,
++    promptCache: true,
++    rag: 'Retrieved context: passage 7919',
++    memory: 'favorite_color: blue',
++  },
++  'anthropic promptCache: queued files with web search': {
++    provider: Providers.ANTHROPIC,
++    promptCache: true,
++    instructions: 'Base.',
++    webSearch: true,
++    queuedFile: true,
++  },
++  'anthropic promptCache: instructions only': {
++    provider: Providers.ANTHROPIC,
++    promptCache: true,
++    instructions: 'Base.',
++  },
++  handoff: [
++    {
++      id: 'agent_router',
++      instructions: 'Route.',
++      artifacts: ArtifactModes.DEFAULT,
++      webSearch: true,
++    },
++    {
++      id: 'agent_writer',
++      provider: Providers.ANTHROPIC,
++      instructions: 'Write.',
++      memoryTools: true,
++      memory: 'tone: formal',
++    },
++  ],
++};
++
++async function prepareCase(setup: AgentSetup | AgentSetup[], stableContext: boolean) {
++  const setups = Array.isArray(setup) ? setup : [setup];
++  return Promise.all(setups.map((item) => prepareAgent(item, stableContext)));
++}
++
++describe.each([false])(
++  'system prompt assembly is byte-identical to string concatenation (stableContext %s)',
++  (stableContext) => {
++    it.each(Object.keys(CASES))('%s', async (name) => {
++      const agents = await prepareCase(CASES[name], stableContext);
++      expect(await captureGraphInputs(agents, stableContext)).toMatchSnapshot();
++    });
++
++    it.each([false, true])(
++      'isolated subagent with an always-apply skill and runtime context (promptCache %s)',
++      async (promptCache) => {
++        const child = await prepareAgent(
++          {
++            provider: Providers.ANTHROPIC,
++            promptCache,
++            id: 'agent_child',
++            instructions: 'Child.',
++            artifacts: ArtifactModes.DEFAULT,
++            webSearch: true,
++            memory: 'favorite_color: blue',
++          },
++          stableContext,
++        );
++        child.alwaysApplySkillPrimes = [
++          { name: 'house-style', body: 'Use sentence case.\n', skillId: 'skill-1', version: 1 },
++        ];
++        const parent = await prepareAgent(
++          {
++            provider: Providers.ANTHROPIC,
++            promptCache,
++            instructions: 'Parent.',
++            webSearch: true,
++            memory: 'favorite_color: blue',
++            rag: 'Retrieved context: passage 7919',
++          },
++          stableContext,
++        );
++        parent.subagents = { enabled: true, allowSelf: false, agent_ids: ['agent_child'] };
++        parent.subagentAgentConfigs = [child];
++        expect(await captureGraphInputs([parent], stableContext)).toMatchSnapshot();
++      },
++    );
++  },
++);
+diff --git a/packages/api/src/agents/contextUpdates.boundary.spec.ts b/packages/api/src/agents/contextUpdates.boundary.spec.ts
+new file mode 100644
+index 000000000..6ab91a4c4
+--- /dev/null
++++ b/packages/api/src/agents/contextUpdates.boundary.spec.ts
+@@ -0,0 +1,93 @@
++import { ContentTypes } from 'librechat-data-provider';
++import { formatAgentMessages, formatMessage } from '@librechat/agents';
++import { findSummaryBoundaryIndex } from './contextUpdates';
++
++type Row = {
++  messageId: string;
++  isCreatedByUser: boolean;
++  sender: string;
++  text: string;
++  content?: unknown[];
++};
++
++const user = (n: number): Row => ({
++  messageId: `u${n}`,
++  isCreatedByUser: true,
++  sender: 'User',
++  text: `question-${n}`,
++});
++
++const assistant = (n: number, summary?: { retainedFromMessageId?: string }): Row => ({
++  messageId: `a${n}`,
++  isCreatedByUser: false,
++  sender: 'Assistant',
++  text: `answer-${n}`,
++  content: [
++    ...(summary
++      ? [
++          {
++            type: ContentTypes.SUMMARY,
++            content: [{ type: ContentTypes.TEXT, text: 'Earlier discussion.' }],
++            boundary: { messageId: `a${n}`, contentIndex: 0 },
++            ...(summary.retainedFromMessageId ? { coverage: summary } : {}),
++          },
++        ]
++      : []),
++    { type: ContentTypes.TEXT, text: `answer-${n}` },
++  ],
++});
++
++/** The user questions the SDK formatter keeps in the prompt, in order. */
++function visibleQuestions(rows: Row[]): string[] {
++  /** The formatter resolves `coverage` through the source message ids, which the payload keeps. */
++  const formatted = rows.map((message) => ({
++    ...formatMessage({ message: message as never }),
++    messageId: message.messageId,
++  }));
++  const { messages } = formatAgentMessages(formatted as never, {});
++  return messages
++    .filter((message) => message.getType() === 'human')
++    .map((message) => JSON.stringify(message.content))
++    .flatMap((text) => text.match(/question-\d+/g) ?? []);
++}
++
++const questionsFrom = (rows: Row[], index: number) =>
++  rows
++    .slice(index)
++    .filter((row) => row.isCreatedByUser)
++    .map((row) => row.text);
++
++/**
++ * `findSummaryBoundaryIndex` mirrors the SDK formatter's summary boundary. If the formatter
++ * changes where it cuts the history, these cases fail and the predicate must follow.
++ */
++describe('findSummaryBoundaryIndex against the SDK formatter', () => {
++  const cases: Array<[string, Row[]]> = [
++    ['no summary', [user(1), assistant(1), user(2), assistant(2), user(3)]],
++    [
++      'summary on an earlier answer keeps history from that answer',
++      [user(1), assistant(1, {}), user(2), assistant(2), user(3)],
++    ],
++    [
++      'latest of two summaries wins',
++      [user(1), assistant(1, {}), user(2), assistant(2, {}), user(3)],
++    ],
++    [
++      'coverage names an earlier retained user message',
++      [user(1), assistant(1), user(2), assistant(2, { retainedFromMessageId: 'u2' }), user(3)],
++    ],
++    [
++      'coverage names a later message than the carrier',
++      [user(1), assistant(1, { retainedFromMessageId: 'u2' }), user(2), assistant(2), user(3)],
++    ],
++  ];
++
++  it.each(cases)('%s', (_name, rows) => {
++    const boundary = findSummaryBoundaryIndex(rows);
++    const visible = visibleQuestions(rows);
++    const expected = questionsFrom(rows, boundary);
++    /** The formatter may reopen the history with the carrier's own question; never with older ones. */
++    expect(visible.slice(-expected.length)).toEqual(expected);
++    expect(visible.length - expected.length).toBeLessThanOrEqual(0);
++  });
++});
+diff --git a/packages/api/src/agents/contextUpdates.spec.ts b/packages/api/src/agents/contextUpdates.spec.ts
+new file mode 100644
+index 000000000..986488dc3
+--- /dev/null
++++ b/packages/api/src/agents/contextUpdates.spec.ts
+@@ -0,0 +1,201 @@
++import { ContentTypes } from 'librechat-data-provider';
++import {
++  formatContextUpdate,
++  findSummaryBoundaryIndex,
++  hasConversationDateContext,
++  findSummarySegment,
++  getTurnContextUpdates,
++  getTurnUserMessageCreatedAt,
++  createHistoryContextUpdates,
++} from './contextUpdates';
++import type { ContextUpdateMessage } from './contextUpdates';
++
++const user = (messageId: string, createdAt?: string): ContextUpdateMessage => ({
++  messageId,
++  isCreatedByUser: true,
++  createdAt,
++});
++const assistant = (
++  messageId: string,
++  createdAt: string,
++  content?: unknown[],
++): ContextUpdateMessage => ({ messageId, isCreatedByUser: false, createdAt, content });
++
++const summaryPart = (coverage?: { retainedFromMessageId?: string }) => ({
++  type: ContentTypes.SUMMARY,
++  content: [{ type: ContentTypes.TEXT, text: 'Earlier discussion.' }],
++  boundary: { messageId: 'm', contentIndex: 0 },
++  ...(coverage ? { coverage } : {}),
++});
++
++/** 23:00 on Monday 2026-03-09 in Nairobi (UTC+3). */
++const START = '2026-03-09T20:00:00.000Z';
++
++describe('formatContextUpdate', () => {
++  it('wraps lines in a context_update block', () => {
++    expect(formatContextUpdate(['a', 'b'])).toBe('<context_update>\na\nb\n</context_update>');
++  });
++});
++
++describe('findSummaryBoundaryIndex', () => {
++  it('is 0 without a summary', () => {
++    expect(findSummaryBoundaryIndex([user('u1'), assistant('a1', START)])).toBe(0);
++  });
++
++  it('keeps history from the message carrying the latest usable summary', () => {
++    const messages = [
++      user('u1'),
++      assistant('a1', START, [summaryPart()]),
++      user('u2'),
++      assistant('a2', START, [summaryPart()]),
++      user('u3'),
++    ];
++    expect(findSummaryBoundaryIndex(messages)).toBe(3);
++  });
++
++  it('keeps history from the covered message in coverage mode', () => {
++    const messages = [
++      user('u1'),
++      assistant('a1', START),
++      user('u2'),
++      assistant('a2', START, [summaryPart({ retainedFromMessageId: 'u2' })]),
++    ];
++    expect(findSummaryBoundaryIndex(messages)).toBe(2);
++  });
++
++  it('falls back to the carrying message when coverage names an unknown or later message', () => {
++    const messages = [
++      user('u1'),
++      assistant('a1', START, [summaryPart({ retainedFromMessageId: 'u2' })]),
++      user('u2'),
++    ];
++    expect(findSummaryBoundaryIndex(messages)).toBe(1);
++  });
++
++  it('ignores summaries that failed or never finished', () => {
++    const messages = [
++      user('u1'),
++      assistant('a1', START, [{ ...summaryPart(), failed: true }]),
++      assistant('a2', START, [{ ...summaryPart(), boundary: undefined }]),
++    ];
++    expect(findSummaryBoundaryIndex(messages)).toBe(0);
++  });
++});
++
++describe('findSummarySegment', () => {
++  it('reports the message carrying the latest usable summary and the first visible one', () => {
++    const messages = [
++      user('u1', START),
++      assistant('a1', START, [summaryPart()]),
++      user('u2', START),
++      assistant('a2', START, [summaryPart({ retainedFromMessageId: 'u2' })]),
++      user('u3'),
++    ];
++    expect(findSummarySegment(messages)).toEqual({ carrier: 3, visibleFrom: 2 });
++    expect(findSummarySegment([user('u1'), assistant('a1', START)])).toEqual({
++      carrier: -1,
++      visibleFrom: 0,
++    });
++  });
++});
++
++describe('getTurnContextUpdates', () => {
++  const entries = [{ key: 'artifacts', value: 'default' }];
++  it('returns the entries only for the user message they were planned for', () => {
++    const req = { turnContextUpdates: { messageId: 'u2', entries } };
++    expect(getTurnContextUpdates(req, 'u2')).toBe(entries);
++    expect(getTurnContextUpdates(req, 'u1')).toBeUndefined();
++    expect(getTurnContextUpdates({}, 'u2')).toBeUndefined();
++    expect(getTurnContextUpdates(undefined, undefined)).toBeUndefined();
++  });
++});
++
++describe('hasConversationDateContext', () => {
++  it('detects the web search runtime context or temporal instructions', () => {
++    expect(hasConversationDateContext([{ dynamicToolContextMap: { web_search: 'x' } }])).toBe(true);
++    expect(
++      hasConversationDateContext([
++        {},
++        { dynamicToolContextMap: { agent_temporal_instructions: 'Today is ...' } },
++      ]),
++    ).toBe(true);
++    expect(hasConversationDateContext([null, { dynamicToolContextMap: { other: 'x' } }])).toBe(
++      false,
++    );
++  });
++});
++
++const STABLE_CONFIG = { endpoints: { agents: { promptCache: { stableContext: true } } } };
++const TIMESTAMPS_CONFIG = { endpoints: { agents: { promptMessageTimestamps: true } } };
++
++describe('getTurnUserMessageCreatedAt', () => {
++  const turnStartedAt = Date.parse('2026-10-14T13:41:07.250Z');
++
++  it.each([
++    ['stableContext', STABLE_CONFIG],
++    ['promptMessageTimestamps', TIMESTAMPS_CONFIG],
++  ])('dates the stored user message by the turn start with %s', (_name, config) => {
++    expect(getTurnUserMessageCreatedAt({ turnStartedAt, config })).toEqual(new Date(turnStartedAt));
++  });
++
++  it('leaves the storage timestamp when neither feature that reads it is on', () => {
++    expect(getTurnUserMessageCreatedAt({ turnStartedAt })).toBeUndefined();
++    expect(getTurnUserMessageCreatedAt({ turnStartedAt, config: {} })).toBeUndefined();
++  });
++
++  it('leaves the storage timestamp when the turn start is unknown', () => {
++    expect(getTurnUserMessageCreatedAt(undefined)).toBeUndefined();
++    expect(getTurnUserMessageCreatedAt({ config: STABLE_CONFIG })).toBeUndefined();
++    expect(
++      getTurnUserMessageCreatedAt({ turnStartedAt: Number.NaN, config: STABLE_CONFIG }),
++    ).toBeUndefined();
++  });
++});
++
++describe('createHistoryContextUpdates', () => {
++  const AGENT_WITH_DATE = { dynamicToolContextMap: { web_search: 'stated' } };
++  const messages = [
++    user('u1', START),
++    assistant('a1', START),
++    user('u2', '2026-03-10T10:00:00.000Z'),
++  ];
++  const run = (config: object, agents: object[] = [AGENT_WITH_DATE]) => {
++    const history = createHistoryContextUpdates({
++      req: {
++        conversationCreatedAt: START,
++        turnStartedAt: '2026-03-10T10:00:00.000Z',
++        body: { timezone: 'Africa/Nairobi' },
++        config,
++      },
++      messages,
++      agents,
++    });
++    const formatted = messages.map(() => ({ content: 'text' }));
++    const applied = formatted.map((message, index) => history.apply(message as never, index));
++    return { history, formatted, applied };
++  };
++
++  it('prepends the date-change note to the prompt copy with stableContext', () => {
++    const { history, formatted, applied } = run(STABLE_CONFIG);
++    expect(history.hasUpdates).toBe(true);
++    expect(applied[2]).toContain('Current date changed to: 2026-03-10 (Tue)');
++    expect(formatted[2].content).toContain(applied[2] as string);
++    expect(formatted[0].content).toBe('text');
++  });
++
++  it('announces nothing without stableContext, so the history is as stored', () => {
++    const { history, formatted } = run({});
++    expect(history.hasUpdates).toBe(false);
++    expect(formatted.every((message) => message.content === 'text')).toBe(true);
++  });
++
++  it('announces nothing when no agent states the conversation date', () => {
++    expect(run(STABLE_CONFIG, [{}]).history.hasUpdates).toBe(false);
++  });
++
++  it('stamps send times only with promptMessageTimestamps', () => {
++    const { applied } = run(TIMESTAMPS_CONFIG);
++    expect(applied[0]).toContain('Message sent: 2026-03-09 23:00:00 +03:00 (Mon)');
++    expect(applied[2]).not.toContain('Current date changed');
++  });
++});
+diff --git a/packages/api/src/agents/run.spec.ts b/packages/api/src/agents/run.spec.ts
+index 07bdf6093..90109c4d8 100644
+--- a/packages/api/src/agents/run.spec.ts
++++ b/packages/api/src/agents/run.spec.ts
+@@ -1,4 +1,4 @@
+-import { Providers, Run } from '@librechat/agents';
++import { Run, Providers } from '@librechat/agents';
+ import { ReasoningResponseKey } from 'librechat-data-provider';
+ import { ToolMessage, AIMessage, HumanMessage } from '@librechat/agents/langchain/messages';
+ import {
+@@ -12,7 +12,6 @@ import {
+   createRun,
+ } from './run';
+ import { ContextPartKeys, contributeContext } from './systemParts';
+-import { frameDynamicInstructions } from './tail';
+ 
+ describe('getRunDiscoveredTools', () => {
+   it('uses the run discovery snapshot instead of reconstructing it from messages', () => {
+@@ -532,17 +531,43 @@ describe('createRun instructions with prompt caching', () => {
+     async (provider) => {
+       const input = await agentInput(provider, true, withParts());
+       expect(input.instructions).toBe(`Base instructions.\n\n${STATIC}\n${RUNTIME}`);
+-      expect(input.additional_instructions).toBe(
+-        frameDynamicInstructions({ instructions: VOLATILE, provider, promptCache: true }),
+-      );
++      expect(input.additional_instructions).toBe(VOLATILE);
+     },
+   );
+ 
++  it('merges everything when no part is per-turn', async () => {
++    const input = await agentInput(Providers.ANTHROPIC, true, { additional_instructions: STATIC });
++    expect(input.instructions).toBe(`Base instructions.\n\n${STATIC}\n${RUNTIME}`);
++    expect(input.additional_instructions).toBeUndefined();
++  });
++
++  it('moves only the per-turn parts when a memory or RAG part is empty', async () => {
++    const input = await agentInput(Providers.ANTHROPIC, true, withParts(''));
++    expect(input.instructions).toBe(`Base instructions.\n\n${STATIC}\n${RUNTIME}`);
++    expect(input.additional_instructions).toBe(MEMORY);
++  });
++
++  it('assembles the tail from the parts, not from a direct write to additional_instructions', async () => {
++    const input = await agentInput(Providers.ANTHROPIC, true, {
++      ...withParts(),
++      additional_instructions: 'Written directly.',
++    });
++    expect(input.instructions).toBe(`Base instructions.\n\n${STATIC}\n${RUNTIME}`);
++    expect(input.additional_instructions).toBe(VOLATILE);
++    expect(JSON.stringify(input)).not.toContain('Written directly.');
++  });
++
++  it('builds the request as before when stableContext is off', async () => {
++    const input = await agentInput(Providers.ANTHROPIC, true, withParts(), false);
++    expect(input.instructions).toBe('Base instructions.');
++    expect(input.additional_instructions).toBe(`${RUNTIME}\n${STATIC}\n\n${VOLATILE}`);
++  });
++
+   it.each([
+     [Providers.ANTHROPIC, false],
+     [Providers.OPENROUTER, false],
+     [Providers.OPENAI, true],
+-    [Providers.BEDROCK, false],
++    [Providers.BEDROCK, true],
+     [Providers.GOOGLE, true],
+   ])('keeps the split for %s (promptCache %s)', async (provider, promptCache) => {
+     const input = await agentInput(provider, promptCache, withParts());
+@@ -578,9 +603,17 @@ describe('createRun instructions with prompt caching', () => {
+       ...queuedFiles(),
+     });
+     expect(input.instructions).toBe(`Base instructions.\n\n${STATIC}\n${RUNTIME}`);
+-    expect(input.additional_instructions.indexOf(`${VOLATILE}\n\n`)).toBeGreaterThan(0);
+-    expect(input.additional_instructions.indexOf('report.csv')).toBeGreaterThan(
+-      input.additional_instructions.indexOf(VOLATILE),
+-    );
++    expect(input.additional_instructions.startsWith(`${VOLATILE}\n\n`)).toBe(true);
++    expect(input.additional_instructions).toContain('report.csv');
++  });
++
++  it('keeps the queued file context in place when nothing is merged', async () => {
++    const input = await agentInput(Providers.OPENAI, false, {
++      additional_instructions: STATIC,
++      ...queuedFiles(),
++    });
++    expect(input.instructions).toBe('Base instructions.');
++    expect(input.additional_instructions.startsWith(`${STATIC}\n${RUNTIME}\n`)).toBe(true);
++    expect(input.additional_instructions).toContain('report.csv');
+   });
+ });
+diff --git a/packages/api/src/agents/systemParts.spec.ts b/packages/api/src/agents/systemParts.spec.ts
+index 701b187fa..41a0d9aa3 100644
+--- a/packages/api/src/agents/systemParts.spec.ts
++++ b/packages/api/src/agents/systemParts.spec.ts
+@@ -1,11 +1,13 @@
+ import { Providers } from '@librechat/agents';
+-import type { ContextAgent } from './systemParts';
+ import {
+   ContextPartKeys,
++  listContextParts,
+   contributeContext,
+   assembleSystemPrompt,
++  assembleAdditionalInstructions,
+   sdkMovesDynamicInstructions,
+ } from './systemParts';
++import type { ContextAgent } from './systemParts';
+ 
+ describe('contributeContext', () => {
+   it('assembles parts in canonical order, whatever order they arrive in', () => {
+@@ -16,6 +18,108 @@ describe('contributeContext', () => {
+     contributeContext(agent, ContextPartKeys.artifacts, 'Artifacts');
+     expect(agent.additional_instructions).toBe('Project\n\nGuard\n\nArtifacts\n\nSkills');
+   });
++
++  it('replaces a part contributed twice instead of repeating it', () => {
++    const agent: ContextAgent = {};
++    contributeContext(agent, ContextPartKeys.project, 'Old project');
++    contributeContext(agent, ContextPartKeys.artifacts, 'Artifacts');
++    contributeContext(agent, ContextPartKeys.project, 'New project');
++    expect(agent.additional_instructions).toBe('New project\n\nArtifacts');
++  });
++
++  it('keeps existing additional instructions as the agent part, ahead of the others', () => {
++    const agent: ContextAgent = { additional_instructions: 'Own' };
++    contributeContext(agent, ContextPartKeys.artifacts, 'Artifacts');
++    expect(agent.contextParts).toEqual({ agent: 'Own', artifacts: 'Artifacts' });
++    expect(agent.additional_instructions).toBe('Own\n\nArtifacts');
++  });
++
++  it('does not change agent copies made before the contribution', () => {
++    const agent: ContextAgent = {};
++    contributeContext(agent, ContextPartKeys.artifacts, 'Artifacts');
++    const copy = { ...agent };
++    contributeContext(copy, ContextPartKeys.alwaysApplySkills, 'Skill');
++    expect(agent.contextParts).toEqual({ artifacts: 'Artifacts' });
++    expect(agent.additional_instructions).toBe('Artifacts');
++    expect(copy.additional_instructions).toBe('Artifacts\n\nSkill');
++  });
++
++  it('rejects keys outside the registry and tool context map keys', () => {
++    expect(() => contributeContext({}, 'unknown', 'x')).toThrow('Unknown system prompt part');
++    expect(() => contributeContext({}, 'runtime:web_search', 'x')).toThrow(
++      'Unknown system prompt part',
++    );
++  });
++});
++
++describe('assembleAdditionalInstructions', () => {
++  it('leaves initialization parts untrimmed until request context is applied', () => {
++    const agent: ContextAgent = {};
++    contributeContext(agent, ContextPartKeys.project, 'Project\n');
++    expect(agent.additional_instructions).toBe('Project\n');
++    contributeContext(agent, ContextPartKeys.memory, 'Memory\n');
++    expect(agent.additional_instructions).toBe('Project\n\nMemory');
++  });
++
++  it('trims once request context is applied, even when it adds nothing', () => {
++    const agent: ContextAgent = {};
++    contributeContext(agent, ContextPartKeys.project, ' Project\n');
++    contributeContext(agent, ContextPartKeys.rag, undefined);
++    expect(agent.contextParts).toEqual({ project: ' Project\n', rag: '' });
++    expect(agent.additional_instructions).toBe('Project');
++  });
++
++  it('returns undefined when every part is empty', () => {
++    const agent: ContextAgent = {};
++    contributeContext(agent, ContextPartKeys.rag, '');
++    contributeContext(agent, ContextPartKeys.memory, '  ');
++    expect(agent.additional_instructions).toBeUndefined();
++  });
++
++  it('appends subagent parts after the request block as given', () => {
++    const agent: ContextAgent = {};
++    contributeContext(agent, ContextPartKeys.alwaysApplySkills, 'Skill\n');
++    contributeContext(agent, ContextPartKeys.artifacts, 'Artifacts');
++    contributeContext(agent, ContextPartKeys.memory, 'Memory');
++    expect(agent.additional_instructions).toBe('Artifacts\n\nMemory\n\nSkill\n');
++  });
++
++  it('assembles the subset of parts a filter selects', () => {
++    const agent: ContextAgent = {};
++    contributeContext(agent, ContextPartKeys.artifacts, 'Artifacts');
++    contributeContext(agent, ContextPartKeys.rag, 'Retrieved');
++    contributeContext(agent, ContextPartKeys.agentFiles, 'Files');
++    expect(assembleAdditionalInstructions(agent, ({ kind }) => kind !== 'turn')).toBe(
++      'Artifacts\n\nFiles',
++    );
++    expect(agent.additional_instructions).toBe('Artifacts\n\nRetrieved\n\nFiles');
++    expect(assembleAdditionalInstructions(agent, ({ kind }) => kind === 'turn')).toBe('Retrieved');
++  });
++});
++
++describe('listContextParts', () => {
++  it('classifies every part and orders tool instructions first, runtime context last', () => {
++    const agent: ContextAgent = {
++      toolContextMap: { web_search: 'Search instructions', skipped: { not: 'text' } },
++      dynamicToolContextMap: {
++        queued_code_files: 'Queued',
++        web_search: 'Started at',
++        custom_tool: 'Custom',
++      },
++    };
++    contributeContext(agent, ContextPartKeys.agentFiles, 'Files');
++    contributeContext(agent, ContextPartKeys.rag, 'Retrieved');
++    contributeContext(agent, ContextPartKeys.project, 'Project');
++    expect(listContextParts(agent).map(({ key, kind }) => [key, kind])).toEqual([
++      ['tool:web_search', 'static'],
++      ['project', 'conversation'],
++      ['rag', 'turn'],
++      ['agent_files', 'static'],
++      ['runtime:queued_code_files', 'turn'],
++      ['runtime:web_search', 'conversation'],
++      ['runtime:custom_tool', 'turn'],
++    ]);
++  });
+ });
+ 
+ describe('assembleSystemPrompt', () => {
+@@ -38,6 +142,43 @@ describe('assembleSystemPrompt', () => {
+     });
+   });
+ 
++  it('puts runtime context ahead of the tail without stableContext', () => {
++    expect(
++      assembleSystemPrompt({
++        instructions: 'Base',
++        additional_instructions: 'Artifacts',
++        toolContextMap: { web_search: 'Search instructions' },
++        dynamicToolContextMap: { web_search: 'Started at', execute_code: 'Files' },
++      }),
++    ).toEqual({
++      instructions: 'Search instructions\nBase',
++      additional_instructions: 'Started at\nFiles\nArtifacts',
++    });
++  });
++
++  it('never moves parts without stableContext', () => {
++    const agent: ContextAgent = { instructions: 'Base' };
++    contributeContext(agent, ContextPartKeys.artifacts, 'Artifacts');
++    contributeContext(agent, ContextPartKeys.rag, 'Retrieved');
++    expect(assembleSystemPrompt(agent, { moveTurnPartsOnly: true })).toEqual({
++      instructions: 'Base',
++      additional_instructions: 'Artifacts\n\nRetrieved',
++    });
++  });
++
++  it('handles missing parts', () => {
++    expect(
++      assembleSystemPrompt(
++        { dynamicToolContextMap: { web_search: 'Started at' } },
++        { stableContext },
++      ),
++    ).toEqual({ instructions: '', additional_instructions: 'Started at' });
++    expect(assembleSystemPrompt({ additional_instructions: 'Artifacts' })).toEqual({
++      instructions: '',
++      additional_instructions: 'Artifacts',
++    });
++  });
++
+   it('moves only per-turn parts when asked, keeping the rest with the instructions', () => {
+     const agent: ContextAgent = {
+       instructions: 'Base',
+@@ -55,20 +196,65 @@ describe('assembleSystemPrompt', () => {
+       'Artifacts\n\nRetrieved\n\n\nMemory\n\nFiles\nStarted at\nQueued',
+     );
+   });
++
++  it('sends a runtime key it does not know with the per-turn parts', () => {
++    const agent: ContextAgent = {
++      instructions: 'Base',
++      dynamicToolContextMap: { web_search: 'Started at', new_tool: 'Changes every turn' },
++    };
++    contributeContext(agent, ContextPartKeys.artifacts, 'Artifacts');
++    expect(assembleSystemPrompt(agent, { stableContext, moveTurnPartsOnly: true })).toEqual({
++      instructions: 'Base\n\nArtifacts\nStarted at',
++      additional_instructions: 'Changes every turn',
++    });
++  });
++
++  it('treats additional instructions without parts as stable', () => {
++    expect(
++      assembleSystemPrompt(
++        { additional_instructions: ' Own\n' },
++        { stableContext, moveTurnPartsOnly: true },
++      ),
++    ).toEqual({ instructions: 'Own', additional_instructions: '' });
++  });
++
++  it('takes the tail from the parts when additional_instructions is written directly', () => {
++    const agent: ContextAgent = {};
++    contributeContext(agent, ContextPartKeys.artifacts, 'Artifacts');
++    agent.additional_instructions = 'Written directly';
++    expect(assembleSystemPrompt(agent, { stableContext }).additional_instructions).toBe(
++      'Artifacts',
++    );
++    expect(assembleSystemPrompt(agent).additional_instructions).toBe('Artifacts');
++  });
+ });
+ 
+ describe('sdkMovesDynamicInstructions', () => {
+-  it.each([Providers.ANTHROPIC, Providers.OPENROUTER, Providers.BEDROCK])(
++  it.each([Providers.ANTHROPIC, Providers.OPENROUTER])(
+     'is true for %s with promptCache enabled',
+     (provider) => {
+       expect(sdkMovesDynamicInstructions(provider, { promptCache: true })).toBe(true);
+     },
+   );
+ 
+-  it.each([Providers.OPENAI, Providers.GOOGLE, Providers.AZURE, 'custom'])(
++  it.each([Providers.ANTHROPIC, Providers.OPENROUTER])(
++    'is false for %s without promptCache',
++    (provider) => {
++      expect(sdkMovesDynamicInstructions(provider, {})).toBe(false);
++      expect(sdkMovesDynamicInstructions(provider, { promptCache: false })).toBe(false);
++      expect(sdkMovesDynamicInstructions(provider, { promptCache: 'true' })).toBe(false);
++      expect(sdkMovesDynamicInstructions(provider, undefined)).toBe(false);
++    },
++  );
++
++  it.each([Providers.OPENAI, Providers.BEDROCK, Providers.GOOGLE, Providers.AZURE, 'custom'])(
+     'is false for %s even with promptCache',
+     (provider) => {
+       expect(sdkMovesDynamicInstructions(provider, { promptCache: true })).toBe(false);
+     },
+   );
++
++  it('is false without a provider', () => {
++    expect(sdkMovesDynamicInstructions(undefined, { promptCache: true })).toBe(false);
++  });
+ });
+diff --git a/packages/api/src/agents/turnContext/anchor.spec.ts b/packages/api/src/agents/turnContext/anchor.spec.ts
+index 33bc6e001..6ec85c537 100644
+--- a/packages/api/src/agents/turnContext/anchor.spec.ts
++++ b/packages/api/src/agents/turnContext/anchor.spec.ts
+@@ -1,5 +1,32 @@
+ import { ContextPartKeys, contributeContext, listContextParts } from '../systemParts';
+-import { applyTurnMemoryToAgent } from './anchor';
++import { applyTurnContextToRuntime, applyTurnMemoryToAgent, getConversationAgents } from './anchor';
++
++describe('getConversationAgents', () => {
++  it('is empty without a plan and holds the primary and the other agents with one', () => {
++    const primary = { id: 'a' };
++    const other = { id: 'b' };
++    expect(getConversationAgents(null, primary, [other]).size).toBe(0);
++    expect([...getConversationAgents({}, primary, [other])]).toEqual([primary, other]);
++  });
++});
++
++describe('applyTurnContextToRuntime', () => {
++  it('renders the agent and records the memory and retrieved texts', () => {
++    const agent: { instructions: string; additional_instructions?: string } = {
++      instructions: 'Base',
++    };
++    const memories = new Set<string>();
++    const files = new Set<string>();
++    applyTurnContextToRuntime(
++      agent as never,
++      { block: 'Anchored.', memoryTexts: ['m1'], ragTexts: ['r1'] },
++      { memories, files },
++    );
++    expect(agent.additional_instructions).toContain('Anchored.');
++    expect([...memories]).toEqual(['m1']);
++    expect([...files]).toEqual(['r1']);
++  });
++});
+ 
+ describe('applyTurnMemoryToAgent', () => {
+   it('replaces the live per-turn memory of a handoff target with the anchored memory block', () => {
+diff --git a/packages/api/src/agents/turnContext/prepare.spec.ts b/packages/api/src/agents/turnContext/prepare.spec.ts
+index 9b464ef83..e31163557 100644
+--- a/packages/api/src/agents/turnContext/prepare.spec.ts
++++ b/packages/api/src/agents/turnContext/prepare.spec.ts
+@@ -1,7 +1,9 @@
+-import type { TurnContextDb, TurnContextRequest } from './prepare';
+ import type { ContextEntry } from './registry';
++import type { TurnContextDb, TurnContextRequest } from './prepare';
++import { memoryInstructions } from '../memory';
+ import {
+   prepareTurnContext,
++  applyHistoryUpdates,
+   planSendContext,
+   readConversationAnchor,
+   prepareResumedTurnContext,
+@@ -43,6 +45,12 @@ describe('prepareTurnContext', () => {
+       anchorPromise: Promise.resolve(ANCHOR),
+     });
+ 
++  it('leaves the prompt live without stableContext', async () => {
++    const req = request({ config: {} });
++    expect(await run(req)).toBeNull();
++    expect(req.turnContextUpdates).toBeUndefined();
++  });
++
+   it('stores the net change on the sent user message', async () => {
+     const req = request();
+     const prepared = await run(req);
+@@ -54,27 +62,63 @@ describe('prepareTurnContext', () => {
+   });
+ 
+   it('writes nothing for a regeneration and renders what the message stored', async () => {
+-    const stored = [{ key: 'date', value: '2026-03-10 (Tuesday)' }];
++    const stored = [{ key: 'date', value: '2026-03-10 (Tue)' }];
+     const req = request();
+     const prepared = await run(req, { isRegenerate: true }, history({ contextUpdates: stored }));
+     expect(req.turnContextUpdates).toBeUndefined();
+     expect(prepared?.plan.currentEntries).toBeUndefined();
+-    expect(prepared?.plan.updates.get(2)).toContain('Current date: 2026-03-10 (Tuesday)');
++    expect(prepared?.plan.updates.get(2)).toContain('Current date: 2026-03-10 (Tue)');
++  });
++
++  it('writes nothing for a regeneration flagged on the request body', async () => {
++    const req = request({ body: { timezone: 'UTC', isRegenerate: true } });
++    await run(req);
++    expect(req.turnContextUpdates).toBeUndefined();
++  });
++
++  it('keeps the prompt live when the anchor cannot be read', async () => {
++    const prepared = await prepareTurnContext({
++      req: request(),
++      agent: agent(),
++      allAgents: [],
++      orderedMessages: history(),
++      anchorPromise: Promise.reject(new Error('read failed')),
++    });
++    expect(prepared).toBeNull();
++  });
++
++  it('returns the anchor this turn opened as pending', async () => {
++    const prepared = await prepareTurnContext({
++      req: request(),
++      agent: agent(),
++      allAgents: [{ agent: agent() }],
++      orderedMessages: history(),
++      conversationId: 'c1',
++      anchorPromise: Promise.resolve(null),
++    });
++    expect(prepared?.pending).toEqual({
++      messageId: null,
++      conversationId: 'c1',
++      anchor: prepared?.plan.anchor,
++    });
+   });
+ });
+ 
+ describe('prepareTurnContext memory', () => {
+   const EMPTY = { withKeys: '', withoutKeys: '' };
++  const MEMORY_AGENT = { enabled: true, provider: 'openAI', model: 'gpt-4' };
+   const anchored = async ({
+     memories,
+     inlineTools = false,
++    memory,
+   }: {
+     memories?: { withKeys?: string; withoutKeys?: string };
+     inlineTools?: boolean;
++    memory?: { agent?: typeof MEMORY_AGENT };
+   }) => {
+     const primary = { ...agent(), ...(inlineTools ? { memoryToolsRegistered: true } : {}) };
+     const prepared = await prepareTurnContext({
+-      req: request({ config: ON }),
++      req: request({ config: { ...ON, ...(memory ? { memory } : {}) } }),
+       agent: primary,
+       allAgents: [{ agent: primary }],
+       orderedMessages: history(),
+@@ -87,11 +131,35 @@ describe('prepareTurnContext memory', () => {
+ 
+   it('anchors no memory notice for an agent that cannot use memory while the store is empty', async () => {
+     expect(await anchored({ memories: EMPTY })).toBeUndefined();
+-    expect(await anchored({ memories: EMPTY, inlineTools: true })).toBeDefined();
++  });
++
++  it('anchors the notice for an agent with memory tools, or when automatic extraction is on', async () => {
++    expect(await anchored({ memories: EMPTY, inlineTools: true })).toBe(memoryInstructions);
++    expect(await anchored({ memories: EMPTY, memory: { agent: MEMORY_AGENT } })).toBe(
++      memoryInstructions,
++    );
++  });
++
++  it('anchors saved memories for any agent', async () => {
++    const withoutKeys = '1. Likes tea.';
++    expect(await anchored({ memories: { withKeys: '', withoutKeys } })).toBe(
++      `${memoryInstructions}\n\n# Existing memory about the user:\n${withoutKeys}`,
++    );
+   });
+ });
+ 
+ describe('readConversationAnchor', () => {
++  it('reads nothing without stableContext', async () => {
++    const getConvoContextAnchor = jest.fn();
++    const anchor = await readConversationAnchor({
++      req: request({ config: {}, resolvedConversation: { contextAnchor: ANCHOR } }),
++      conversationId: 'c1',
++      db: { getConvoContextAnchor },
++    });
++    expect(anchor).toBeNull();
++    expect(getConvoContextAnchor).not.toHaveBeenCalled();
++  });
++
+   it('uses the conversation the ingress read, without a read of its own', async () => {
+     const getConvoContextAnchor = jest.fn();
+     const anchor = await readConversationAnchor({
+@@ -102,6 +170,40 @@ describe('readConversationAnchor', () => {
+     expect(anchor).toEqual(ANCHOR);
+     expect(getConvoContextAnchor).not.toHaveBeenCalled();
+   });
++
++  it('reads the anchor when an ingress step resolved the conversation without it', async () => {
++    const getConvoContextAnchor = jest.fn().mockResolvedValue(ANCHOR);
++    const anchor = await readConversationAnchor({
++      req: request({ resolvedConversation: {} }),
++      conversationId: 'c1',
++      db: { getConvoContextAnchor },
++    });
++    expect(anchor).toEqual(ANCHOR);
++    expect(getConvoContextAnchor).toHaveBeenCalledWith('user-1', 'c1');
++  });
++
++  it('reads none for a conversation that does not exist yet', async () => {
++    const getConvoContextAnchor = jest.fn();
++    expect(
++      await readConversationAnchor({
++        req: request({ resolvedConversation: null }),
++        conversationId: 'c1',
++        db: { getConvoContextAnchor },
++      }),
++    ).toBeNull();
++    expect(getConvoContextAnchor).not.toHaveBeenCalled();
++  });
++
++  it('falls back to a read when the ingress did not resolve the conversation', async () => {
++    const getConvoContextAnchor = jest.fn().mockResolvedValue(ANCHOR);
++    const anchor = await readConversationAnchor({
++      req: request(),
++      conversationId: 'c1',
++      db: { getConvoContextAnchor },
++    });
++    expect(anchor).toEqual(ANCHOR);
++    expect(getConvoContextAnchor).toHaveBeenCalledWith('user-1', 'c1');
++  });
+ });
+ 
+ describe('prepareResumedTurnContext', () => {
+@@ -134,6 +236,44 @@ describe('prepareResumedTurnContext', () => {
+       '+contextUpdates +contextAnchor',
+     );
+   });
++
++  it('does nothing without stableContext', async () => {
++    const getMessages = jest.fn();
++    expect(await resume(request({ config: {} }), getMessages)).toBeNull();
++    expect(getMessages).not.toHaveBeenCalled();
++  });
++
++  it('keeps the prompt live when the messages cannot be read', async () => {
++    expect(await resume(request(), jest.fn().mockRejectedValue(new Error('down')))).toBeNull();
++  });
++});
++
++describe('applyHistoryUpdates', () => {
++  it('prepends each block to the prompt copy and counts the added tokens', () => {
++    const messages = [{ content: 'First' }, { content: 'Second' }];
++    const indexTokenCountMap: Record<number, number> = { 0: 1, 1: 1 };
++    const result = applyHistoryUpdates({
++      plan: { updates: new Map([[1, '<context_update>\nx\n</context_update>']]) },
++      formattedMessages: messages as never,
++      indexTokenCountMap,
++      countTokens: (message) => String(message.content).length,
++    });
++    expect(messages[1].content).toBe('<context_update>\nx\n</context_update>\n\nSecond');
++    expect(messages[0].content).toBe('First');
++    expect(result).toEqual({ addedTokens: 38, applied: true });
++    expect(indexTokenCountMap[1]).toBe(39);
++  });
++
++  it('reports nothing applied without updates', () => {
++    expect(
++      applyHistoryUpdates({
++        plan: { updates: new Map() },
++        formattedMessages: [],
++        indexTokenCountMap: {},
++        countTokens: () => 0,
++      }),
++    ).toEqual({ addedTokens: 0, applied: false });
++  });
+ });
+ 
+ describe('planSendContext', () => {
+@@ -151,6 +291,20 @@ describe('planSendContext', () => {
+     }).then((result) => ({ ...result, formattedMessages }));
+   };
+ 
++  it('applies the turn context blocks to the prompt copy when the lever is on', async () => {
++    const result = await send(request());
++    expect(result.prepared?.plan).toBeDefined();
++    expect(result.applied).toBe(true);
++    expect(String(result.formattedMessages[2].content)).toContain('<context_update>');
++  });
++
++  it('leaves the history alone when the lever is off and no note is configured', async () => {
++    const result = await send(request({ config: {} }));
++    expect(result.prepared).toBeNull();
++    expect(result).toMatchObject({ addedTokens: 0, applied: false });
++    expect(result.formattedMessages[2].content).toBe('text');
++  });
++
+   it('adds send-time notes without the turn context when only timestamps are on', async () => {
+     const config = { endpoints: { agents: { promptMessageTimestamps: true } } };
+     const result = await send(request({ config }));
+@@ -189,4 +343,17 @@ describe('storePendingContextAnchor', () => {
+       anchor: ANCHOR,
+     });
+   });
++
++  it('stays pending when nothing was stored or the write failed', async () => {
++    const methods = db();
++    methods.setConvoContextAnchor = jest.fn().mockRejectedValue(new Error('down'));
++    const pending = { messageId: null, conversationId: 'c1', anchor: ANCHOR };
++    expect(await storePendingContextAnchor({ pending, userId: 'user-1', db: methods })).toBe(false);
++    expect(await storePendingContextAnchor({ pending: undefined, userId: 'u', db: methods })).toBe(
++      false,
++    );
++    expect(await storePendingContextAnchor({ pending, userId: undefined, db: methods })).toBe(
++      false,
++    );
++  });
+ });
+diff --git a/packages/api/src/agents/turnContext/turnContext.spec.ts b/packages/api/src/agents/turnContext/turnContext.spec.ts
+index ac6752432..42f2acd1d 100644
+--- a/packages/api/src/agents/turnContext/turnContext.spec.ts
++++ b/packages/api/src/agents/turnContext/turnContext.spec.ts
+@@ -2,10 +2,17 @@ import { ArtifactModes, ContentTypes, EModelEndpoint } from 'librechat-data-prov
+ import type { ContextEntry, SendSnapshot, TurnContextAgent } from './registry';
+ import type { TurnContextMessage } from './anchor';
+ import type { TurnPlan } from './ledger';
++import {
++  ContextSourceKeys,
++  collectLiveContext,
++  renderAnchorText,
++  compareContextKeys,
++} from './registry';
+ import { assembleSystemPrompt, contributeContext, ContextPartKeys } from '../systemParts';
++import { applyTurnContext, createAnchor, reanchor } from './anchor';
++import { formatMemoryContext, memoryInstructions } from '../memory';
++import { QUEUED_CODE_FILES_CONTEXT_KEY } from '~/files/code/queued';
+ import { generateArtifactsPrompt } from '~/prompts';
+-import { formatMemoryContext } from '../memory';
+-import { applyTurnContext } from './anchor';
+ import { planTurnContext } from './ledger';
+ 
+ const TIMEZONE = 'Africa/Nairobi';
+@@ -150,6 +157,133 @@ const summaryPart = (retainedFromMessageId?: string) => ({
+ 
+ const last = (texts: Array<string | undefined>) => texts[texts.length - 1];
+ 
++describe('registry', () => {
++  it('collects every source from the agent and the send-time snapshot', () => {
++    const live = collectLiveContext(
++      snapshotOf(
++        {
++          artifacts: true,
++          project: 'Project',
++          skills: 'Skills',
++          guard: 'Guard',
++          memory: 'Memory',
++          webSearch: true,
++          files: 'data.csv',
++          queued: 'upload.csv',
++          timestamps: true,
++        },
++        minutes(0),
++      ),
++    );
++    expect([...live.entries()]).toEqual([
++      ['memory_guard', 'Guard'],
++      ['artifacts', ArtifactModes.DEFAULT],
++      ['skills', 'Skills'],
++      ['project', 'Project'],
++      ['runtime:web_search', WEB_SEARCH_RUNTIME],
++      ['runtime:execute_code', 'data.csv'],
++      ['date', '2026-03-09 (Mon)'],
++      ['message_time', '2026-03-09 23:00:00 +03:00 (Mon)'],
++      ['memory', 'Memory'],
++      ['queued_code_files', 'upload.csv'],
++    ]);
++  });
++
++  it('keys its sources by the system prompt part they replace', () => {
++    expect(ContextSourceKeys).toMatchObject({
++      memoryGuard: ContextPartKeys.memoryGuard,
++      artifacts: ContextPartKeys.artifacts,
++      skills: ContextPartKeys.skills,
++      project: ContextPartKeys.project,
++      runtimePrefix: ContextPartKeys.runtimePrefix,
++      memory: ContextPartKeys.memory,
++      queuedCodeFiles: QUEUED_CODE_FILES_CONTEXT_KEY,
++    });
++  });
++
++  it('dates and stamps nothing unless the prompt states a date or timestamps are on', () => {
++    const live = collectLiveContext(snapshotOf({}, minutes(0)));
++    expect(live.has(ContextSourceKeys.date)).toBe(false);
++    expect(live.has(ContextSourceKeys.messageTime)).toBe(false);
++  });
++
++  it('stores the artifacts mode and renders the exact prompt initialization contributes', () => {
++    const agent = buildAgent({ artifacts: true });
++    expect(renderAnchorText('artifacts', ArtifactModes.DEFAULT, agent)).toBe(
++      agent.contextParts?.artifacts,
++    );
++    const anthropic = { ...agent, provider: EModelEndpoint.anthropic };
++    expect(renderAnchorText('artifacts', ArtifactModes.SHADCNUI, anthropic)).toBe(
++      generateArtifactsPrompt({
++        endpoint: EModelEndpoint.anthropic,
++        artifacts: ArtifactModes.SHADCNUI,
++      }),
++    );
++  });
++
++  it('dates the anchor and renders nothing in the system prompt for message sources', () => {
++    const agent = buildAgent({});
++    expect(renderAnchorText('date', '2026-03-09 (Mon)', agent)).toBe(
++      'Current date: 2026-03-09 (Mon)',
++    );
++    expect(renderAnchorText('queued_code_files', 'x', agent)).toBe('');
++    expect(renderAnchorText('unknown', 'x', agent)).toBe('');
++  });
++
++  it('orders keys by registry, keys of one prefix by name', () => {
++    const keys = ['memory', 'runtime:web_search', 'date', 'runtime:execute_code', 'project'];
++    expect(keys.sort(compareContextKeys)).toEqual([
++      'project',
++      'runtime:execute_code',
++      'runtime:web_search',
++      'date',
++      'memory',
++    ]);
++  });
++});
++
++describe('anchors', () => {
++  it('anchors the live state sources in registry order', () => {
++    const live = new Map([
++      ['memory', 'M'],
++      ['date', '2026-03-10 (Tue)'],
++      ['message_time', 'now'],
++      ['project', 'P'],
++    ]);
++    expect(createAnchor(live)).toEqual([
++      { key: 'project', value: 'P' },
++      { key: 'date', value: '2026-03-10 (Tue)' },
++      { key: 'memory', value: 'M' },
++    ]);
++  });
++
++  it('re-anchors keeping the previous order, dropping what is off and appending what is new', () => {
++    const previous = [
++      { key: 'memory', value: 'old' },
++      { key: 'artifacts', value: 'default' },
++      { key: 'project', value: 'P' },
++    ];
++    const live = new Map([
++      ['project', 'P2'],
++      ['memory', 'new'],
++      ['skills', 'S'],
++      ['runtime:web_search', 'W'],
++    ]);
++    expect(reanchor(previous, live)).toEqual([
++      { key: 'memory', value: 'new' },
++      { key: 'project', value: 'P2' },
++      { key: 'skills', value: 'S' },
++      { key: 'runtime:web_search', value: 'W' },
++    ]);
++    expect(reanchor(null, live).map(({ key }) => key)).toEqual([
++      'skills',
++      'project',
++      'runtime:web_search',
++      'memory',
++    ]);
++  });
++});
++
+ describe('planTurnContext', () => {
+   const base: State = { project: 'Quote prices in EUR.', memory: 'Likes tea.', webSearch: true };
+ 
+@@ -167,7 +301,7 @@ describe('planTurnContext', () => {
+       [
+         'Quote prices in EUR.',
+         WEB_SEARCH_RUNTIME,
+-        'Current date: 2026-03-09 (Monday)',
++        'Current date: 2026-03-09 (Mon)',
+         'Likes tea.',
+       ].join('\n\n'),
+     );
+@@ -200,6 +334,20 @@ describe('planTurnContext', () => {
+     expect(turn4.plan.block).toBe(first.block);
+   });
+ 
++  it('replaces a changed value and removes one switched off', () => {
++    const convo = new Conversation();
++    convo.send(base, minutes(0));
++    const changed = convo.send({ ...base, project: 'Quote prices in USD.' }, minutes(1));
++    expect(last(changed.texts)).toBe(
++      '<context_update>\nProject guidance (replaces any earlier version):\nQuote prices in USD.\n</context_update>',
++    );
++    const off = convo.send({ ...base, project: undefined }, minutes(2));
++    expect(last(off.texts)).toBe(
++      '<context_update>\nProject guidance no longer applies.\n</context_update>',
++    );
++    expect(off.plan.currentEntries).toEqual([{ key: 'project', value: null }]);
++  });
++
+   describe('toggles flipped before sending', () => {
+     it('leave no trace when they end where they started', () => {
+       const baseline = new Conversation();
+@@ -213,6 +361,26 @@ describe('planTurnContext', () => {
+       expect(result.plan).toEqual(untouched.plan);
+       expect(result.plan.currentEntries).toEqual([]);
+     });
++
++    it('announce exactly one change when they end switched on', () => {
++      const convo = new Conversation();
++      convo.send(base, minutes(0));
++      const { plan, texts } = convo.send({ ...base, artifacts: true }, minutes(1));
++      expect(plan.currentEntries).toHaveLength(1);
++      expect(texts.filter(Boolean)).toHaveLength(1);
++    });
++
++    it('leave no trace when a toggle returns to the anchored value', () => {
++      const convo = new Conversation();
++      convo.send({ ...base, artifacts: true }, minutes(0));
++      convo.send(base, minutes(1));
++      const back = convo.send({ ...base, artifacts: true }, minutes(2));
++      expect(last(back.texts)).toBe(
++        `<context_update>\nArtifacts instructions:\n${ARTIFACTS}\n</context_update>`,
++      );
++      const again = convo.send({ ...base, artifacts: true }, minutes(3));
++      expect(again.plan.currentEntries).toEqual([]);
++    });
+   });
+ 
+   it('follows the parent chain: a branch does not see the changes of another branch', () => {
+@@ -231,6 +399,34 @@ describe('planTurnContext', () => {
+     expect(branchOn.plan.currentEntries).toEqual([{ key: 'artifacts', value: 'default' }]);
+   });
+ 
++  it('overwrites the record of the regenerated message and leaves earlier turns alone', () => {
++    const convo = new Conversation();
++    convo.send(base, minutes(0));
++    convo.send({ ...base, artifacts: true }, minutes(1));
++    const parent = convo.rows[1].messageId;
++
++    const regenerated = convo.send(base, minutes(2), { parentId: parent, reuseId: 'u2' });
++    expect(regenerated.plan.currentEntries).toEqual([]);
++    expect(convo.rows.find((row) => row.messageId === 'u2')?.contextUpdates).toEqual([]);
++    expect(regenerated.texts.filter(Boolean)).toHaveLength(0);
++
++    const next = convo.send(base, minutes(3));
++    expect(next.texts.filter(Boolean)).toHaveLength(0);
++  });
++
++  it('plans no entries for a continued response', () => {
++    const convo = new Conversation();
++    convo.send(base, minutes(0));
++    const messages = convo.branch(convo.rows[1].messageId);
++    const plan = planTurnContext({
++      messages,
++      conversationAnchor: convo.anchor,
++      snapshot: snapshotOf({ ...base, artifacts: true }, minutes(1)),
++    });
++    expect(plan.currentEntries).toBeUndefined();
++    expect(plan.updates.size).toBe(0);
++  });
++
+   describe('compaction', () => {
+     function compacted() {
+       const convo = new Conversation();
+@@ -253,19 +449,24 @@ describe('planTurnContext', () => {
+       expect(plan.anchor).toEqual([
+         { key: 'project', value: 'P2' },
+         { key: 'runtime:web_search', value: WEB_SEARCH_RUNTIME },
+-        { key: 'date', value: '2026-03-09 (Monday)' },
++        { key: 'date', value: '2026-03-09 (Mon)' },
+         { key: 'artifacts', value: 'default' },
+         { key: 'skills', value: 'S' },
+       ]);
+       expect(plan.block).toBe(
+-        ['P2', WEB_SEARCH_RUNTIME, 'Current date: 2026-03-09 (Monday)', ARTIFACTS, 'S'].join(
+-          '\n\n',
+-        ),
++        ['P2', WEB_SEARCH_RUNTIME, 'Current date: 2026-03-09 (Mon)', ARTIFACTS, 'S'].join('\n\n'),
+       );
+       expect(plan.currentEntries).toEqual([]);
+       expect(texts.every((text) => text == null)).toBe(true);
+     });
+ 
++    it('dates the new anchor by its turn: the first message after midnight announces nothing', () => {
++      const convo = compacted();
++      const { plan, texts } = convo.send({ ...base, artifacts: true, project: 'P2' }, minutes(120));
++      expect(plan.block).toContain('Current date: 2026-03-10 (Tue)');
++      expect(texts.every((text) => text == null)).toBe(true);
++    });
++
+     it('does not re-announce changes from before the boundary and keeps the new anchor', () => {
+       const convo = compacted();
+       const state = { ...base, artifacts: true, project: 'P2' };
+@@ -276,9 +477,98 @@ describe('planTurnContext', () => {
+         '<context_update>\nProject guidance (replaces any earlier version):\nP3\n</context_update>',
+       ]);
+     });
++
++    it('still shows message sources of messages a summary retains', () => {
++      const convo = new Conversation();
++      convo.send({ ...base, timestamps: true }, minutes(0));
++      convo.send({ ...base, artifacts: true, timestamps: true }, minutes(1));
++      const carrier = convo.rows[convo.rows.length - 1];
++      carrier.content = [summaryPart('u2')];
++      const { texts, messages } = convo.send({ ...base, artifacts: true }, minutes(2));
++      const u2 = messages.findIndex((m) => m.messageId === 'u2');
++      expect(texts[u2]).toBe(
++        '<context_update>\nMessage sent: 2026-03-09 23:01:00 +03:00 (Mon)\n</context_update>',
++      );
++      expect(texts.slice(0, u2).every((text) => text == null)).toBe(true);
++    });
++
++    it('re-anchors a branch from before the boundary to the conversation anchor', () => {
++      const convo = compacted();
++      const branch = convo.send(base, minutes(3), { parentId: convo.rows[1].messageId });
++      expect(branch.plan.anchorTarget).toBeUndefined();
++      expect(branch.plan.anchor).toEqual(convo.anchor);
++    });
++  });
++
++  describe('conversations started before anchors existed', () => {
++    it('anchors to the current state and renders the old history unchanged', () => {
++      const rows: TurnContextMessage[] = [
++        { messageId: 'u1', isCreatedByUser: true },
++        { messageId: 'a1', isCreatedByUser: false },
++        { messageId: 'u2', isCreatedByUser: true },
++      ];
++      const plan = planTurnContext({
++        messages: rows,
++        conversationAnchor: null,
++        snapshot: snapshotOf({ ...base, artifacts: true }, minutes(5)),
++        currentIndex: 2,
++      });
++      expect(plan.anchorTarget).toEqual({ messageId: null });
++      expect(plan.anchor.map(({ key }) => key)).toContain('artifacts');
++      expect(plan.updates.size).toBe(0);
++    });
++
++    it('dates the anchor by the turn that sets it, announcing nothing', () => {
++      const plan = planTurnContext({
++        messages: [
++          { messageId: 'u1', isCreatedByUser: true },
++          { messageId: 'a1', isCreatedByUser: false },
++          { messageId: 'u2', isCreatedByUser: true },
++        ],
++        conversationAnchor: null,
++        snapshot: snapshotOf(base, '2026-03-11T08:00:00.000Z'),
++        currentIndex: 2,
++      });
++      expect(plan.block).toContain('Current date: 2026-03-11 (Wed)');
++      expect(plan.updates.size).toBe(0);
++    });
++
++    it('orders a compaction anchor by registry when no earlier anchor exists', () => {
++      const plan = planTurnContext({
++        messages: [
++          { messageId: 'u1', isCreatedByUser: true },
++          { messageId: 'a1', isCreatedByUser: false, content: [summaryPart()] },
++          { messageId: 'u2', isCreatedByUser: true },
++        ],
++        snapshot: snapshotOf({ ...base, artifacts: true }, minutes(1)),
++        currentIndex: 2,
++      });
++      expect(plan.anchorTarget).toEqual({ messageId: 'a1' });
++      expect(plan.anchor.map(({ key }) => key)).toEqual([
++        'artifacts',
++        'project',
++        'runtime:web_search',
++        'date',
++        'memory',
++      ]);
++    });
+   });
+ 
+   describe('memory', () => {
++    it('announces a changed memory as the entries it added and removed, keeping the system prompt', () => {
++      const convo = new Conversation();
++      const first = convo.send(base, minutes(0)).plan;
++      const changed = convo.send({ ...base, memory: 'Likes tea. Works in logistics.' }, minutes(1));
++      expect(changed.plan.block).toBe(first.block);
++      expect(last(changed.texts)).toBe(
++        '<context_update>\nMemory about the user changed:\nAdded:\nLikes tea. Works in logistics.\nRemoved:\nLikes tea.\n</context_update>',
++      );
++      expect(changed.plan.memoryTexts).toEqual([
++        'Likes tea.',
++        'Memory about the user changed:\nAdded:\nLikes tea. Works in logistics.\nRemoved:\nLikes tea.',
++      ]);
++    });
++
+     const formatted = (...entries: string[]) =>
+       formatMemoryContext(entries.map((entry, i) => `${i + 1}. ${entry}`).join('\n\n'));
+     const entry = (key: string, value: string, date = '2026-03-09') =>
+@@ -309,6 +599,49 @@ describe('planTurnContext', () => {
+       );
+     });
+ 
++    it('announces nothing when the memory is the same entries in another order or numbering', () => {
++      const convo = new Conversation();
++      convo.send({ ...base, memory: formatted(entry('a', '1'), entry('b', '2')) }, minutes(0));
++      const same = convo.send(
++        { ...base, memory: formatted(entry('b', '2'), entry('a', '1')) },
++        minutes(1),
++      );
++      expect(same.plan.currentEntries).toEqual([]);
++    });
++
++    it('tracks the memory a later diff starts from through the stored diffs', () => {
++      const convo = new Conversation();
++      convo.send({ ...base, memory: formatted(entry('a', '1')) }, minutes(0));
++      convo.send({ ...base, memory: formatted(entry('a', '1'), entry('b', '2')) }, minutes(1));
++      const third = convo.send({ ...base, memory: formatted(entry('b', '2')) }, minutes(2));
++      expect(last(third.texts)).toBe(
++        `<context_update>\nMemory about the user changed:\nRemoved:\n${entry('a', '1')}\n</context_update>`,
++      );
++      expect(third.texts[2]).toContain(`Added:\n${entry('b', '2')}`);
++    });
++
++    it('states the whole memory when it appears after the anchor', () => {
++      const convo = new Conversation();
++      convo.send({ ...base, memory: undefined }, minutes(0));
++      const memory = formatted(entry('a', '1'));
++      const on = convo.send({ ...base, memory }, minutes(1));
++      expect(last(on.texts)).toContain(`Memory about the user:\n${memoryInstructions}`);
++      expect(last(on.texts)).toContain(entry('a', '1'));
++    });
++
++    it('keeps the anchored memory block while later changes arrive as updates, and drops it while off', () => {
++      const convo = new Conversation();
++      const first = convo.send(base, minutes(0)).plan;
++      expect(first.memoryBlock).toBe('Likes tea.');
++      const changed = convo.send({ ...base, memory: 'Likes tea. Works in logistics.' }, minutes(1));
++      expect(changed.plan.memoryBlock).toBe(first.memoryBlock);
++      const off = convo.send({ ...base, memory: undefined }, minutes(2));
++      expect(off.plan.memoryBlock).toBe('');
++      expect(
++        new Conversation().send({ ...base, memory: undefined }, minutes(0)).plan.memoryBlock,
++      ).toBe('');
++    });
++
+     it('withholds memory everywhere while it is off, and records nothing', () => {
+       const convo = new Conversation();
+       convo.send(base, minutes(0));
+@@ -334,11 +667,42 @@ describe('planTurnContext', () => {
+       const after = convo.send(base, minutes(61));
+       expect(last(before.texts)).toBeUndefined();
+       expect(last(after.texts)).toBe(
+-        '<context_update>\nCurrent date changed to: 2026-03-10 (Tuesday)\n</context_update>',
++        '<context_update>\nCurrent date changed to: 2026-03-10 (Tue)\n</context_update>',
+       );
+       const later = convo.send(base, minutes(120));
+       expect(later.texts.filter(Boolean)).toHaveLength(1);
+     });
++
++    it('renders stored dates the same after the user changes timezone', () => {
++      const convo = new Conversation();
++      convo.send(base, minutes(0));
++      const turn2 = convo.send({ ...base, timestamps: true }, minutes(61));
++      const moved = convo.send({ ...base, timezone: 'America/New_York' }, minutes(62));
++      expect(moved.texts[2]).toBe(turn2.texts[2]);
++      /** The user's local date is the previous day in the new timezone. */
++      expect(last(moved.texts)).toBe(
++        '<context_update>\nCurrent date changed to: 2026-03-09 (Mon)\n</context_update>',
++      );
++    });
++
++    it('keeps tracking the date the anchored system prompt states after its source is off', () => {
++      const convo = new Conversation();
++      convo.send(base, minutes(0));
++      const quiet = convo.send({ ...base, webSearch: false }, minutes(61));
++      expect(last(quiet.texts)).toContain(
++        'Runtime context for the `web_search` tool no longer applies.',
++      );
++      expect(last(quiet.texts)).toContain('Current date changed to: 2026-03-10 (Tue)');
++    });
++
++    it('states the current date when a prompt starts stating one mid-conversation', () => {
++      const convo = new Conversation();
++      convo.send({ project: 'P' }, minutes(0));
++      const on = convo.send({ project: 'P', webSearch: true }, minutes(61));
++      expect(last(on.texts)).toBe(
++        `<context_update>\nRuntime context for the \`web_search\` tool:\n${WEB_SEARCH_RUNTIME}\nCurrent date: 2026-03-10 (Tue)\n</context_update>`,
++      );
++    });
+   });
+ 
+   it('shows queued upload files with their own message only', () => {
+@@ -371,6 +735,44 @@ describe('planTurnContext', () => {
+       expect(last(turn3.texts)).toBe('<context_update>\nPassage 104729\n</context_update>');
+       expect(turn3.plan.block).toBe(turn2.plan.block);
+     });
++
++    it('replays the stored context for a continued response and ignores the new retrieval', () => {
++      const convo = new Conversation();
++      convo.send({ ...base, rag: 'Passage A' }, minutes(0));
++      const plan = planTurnContext({
++        messages: convo.branch(convo.rows[1].messageId),
++        conversationAnchor: convo.anchor,
++        snapshot: snapshotOf({ ...base, rag: 'Passage B' }, minutes(1)),
++      });
++      expect(plan.updates.get(0)).toBe('<context_update>\nPassage A\n</context_update>');
++      expect(plan.currentEntries).toBeUndefined();
++    });
++
++    it('stores nothing for an empty retrieval', () => {
++      const convo = new Conversation();
++      const { plan } = convo.send({ ...base, rag: '  \n' }, minutes(0));
++      expect(plan.currentEntries).toEqual([]);
++    });
++  });
++
++  it('ignores stored entries no source owns and entries that repeat what is known', () => {
++    const plan = planTurnContext({
++      messages: [
++        {
++          messageId: 'u1',
++          isCreatedByUser: true,
++          contextUpdates: [
++            { key: 'retired_source', value: 'x' },
++            { key: 'project', value: 'Quote prices in EUR.' },
++          ],
++        },
++        { messageId: 'u2', isCreatedByUser: true },
++      ],
++      conversationAnchor: [{ key: 'project', value: 'Quote prices in EUR.' }],
++      snapshot: snapshotOf(base, minutes(1)),
++      currentIndex: 1,
++    });
++    expect(plan.updates.has(0)).toBe(false);
+   });
+ });
+ 
+@@ -409,4 +811,12 @@ describe('applyTurnContext', () => {
+       additional_instructions: '',
+     });
+   });
++
++  it('leaves the system prompt unchanged by later live changes', () => {
++    const agent = initialized();
++    applyTurnContext(agent, { block: 'Anchored block.' });
++    const before = assembleSystemPrompt(agent);
++    agent.dynamicToolContextMap = { queued_code_files: 'another.csv', web_search: 'later' };
++    expect(assembleSystemPrompt(agent)).toEqual(before);
++  });
+ });
+diff --git a/packages/api/src/code/attachments.spec.ts b/packages/api/src/code/attachments.spec.ts
+index 61016c3e4..b4ab1542f 100644
+--- a/packages/api/src/code/attachments.spec.ts
++++ b/packages/api/src/code/attachments.spec.ts
+@@ -489,30 +489,20 @@ describe('primeWorkspaceAttachments', () => {
+     );
+   });
+ 
+-  it('lists attachments in upload order with stableContext, in priming order without', async () => {
++  it('lists attachments in upload order, whatever order priming returned them in', async () => {
+     const worker = createFakeWorker();
+     const { deps } = createDeps(worker);
+     const first = remember(chatFile('first.csv', 'one', worker.objects));
+     const second = remember(chatFile('second.csv', 'two', worker.objects));
+ 
+     const newestFirst = agentWith(attachedContext(), [second, first]);
+-    await primeWorkspaceAttachments({
+-      agents: [newestFirst],
+-      deps: { ...deps, uploadOrder: true },
+-    });
++    await primeWorkspaceAttachments({ agents: [newestFirst], deps });
+     const oldestFirst = agentWith(attachedContext(), [first, second]);
+-    await primeWorkspaceAttachments({
+-      agents: [oldestFirst],
+-      deps: { ...deps, uploadOrder: true },
+-    });
+-    const asPrimed = agentWith(attachedContext(), [second, first]);
+-    await primeWorkspaceAttachments({ agents: [asPrimed], deps });
++    await primeWorkspaceAttachments({ agents: [oldestFirst], deps });
+ 
+     const note = newestFirst.dynamicToolContextMap?.[Tools.execute_code] as string;
+     expect(note.indexOf('first.csv')).toBeLessThan(note.indexOf('second.csv'));
+     expect(oldestFirst.dynamicToolContextMap?.[Tools.execute_code]).toBe(note);
+-    const primedNote = asPrimed.dynamicToolContextMap?.[Tools.execute_code] as string;
+-    expect(primedNote.indexOf('second.csv')).toBeLessThan(primedNote.indexOf('first.csv'));
+   });
+ 
+   it('creates the ignore file once and checks it again on a later turn', async () => {
+diff --git a/packages/data-schemas/src/methods/conversation.spec.ts b/packages/data-schemas/src/methods/conversation.spec.ts
+index 4c5edb4f8..ccda307a9 100644
+--- a/packages/data-schemas/src/methods/conversation.spec.ts
++++ b/packages/data-schemas/src/methods/conversation.spec.ts
+@@ -10392,6 +10392,29 @@ describe('conversation context anchor', () => {
+     expect(await methods.getConvo(user, conversationId)).not.toHaveProperty('contextAnchor');
+   });
+ 
++  it('returns the anchor with the conversation only when the caller selects it', async () => {
++    const conversationId = await seed();
++    await methods.setConvoContextAnchor({ user, conversationId, anchor });
++    expect(await methods.getConvo(user, conversationId)).not.toHaveProperty('contextAnchor');
++    expect((await methods.getConvo(user, conversationId, '+contextAnchor'))?.contextAnchor).toEqual(
++      anchor,
++    );
++  });
++
++  it("neither reads nor writes another user's conversation, nor creates one", async () => {
++    const conversationId = await seed();
++    await expect(
++      methods.setConvoContextAnchor({ user: 'intruder', conversationId, anchor }),
++    ).resolves.toBe(false);
++    await methods.setConvoContextAnchor({ user, conversationId, anchor });
++    await expect(methods.getConvoContextAnchor('intruder', conversationId)).resolves.toBeNull();
++    const missing = uuidv4();
++    await expect(
++      methods.setConvoContextAnchor({ user, conversationId: missing, anchor }),
++    ).resolves.toBe(false);
++    expect(await Conversation.findOne({ conversationId: missing }).lean()).toBeNull();
++  });
++
+   it('ignores an anchor submitted through saves, unsets and imports', async () => {
+     const conversationId = await seed();
+     const forged = [{ key: 'project', value: 'Forged.' }];
+diff --git a/packages/data-schemas/src/methods/message.spec.ts b/packages/data-schemas/src/methods/message.spec.ts
+index 9a071284f..f9929357e 100644
+--- a/packages/data-schemas/src/methods/message.spec.ts
++++ b/packages/data-schemas/src/methods/message.spec.ts
+@@ -481,6 +481,39 @@ describe('Message Operations', () => {
+         }
+       });
+ 
++      it('never stores entries on a model response', async () => {
++        await saveMessage(
++          mockCtx,
++          { ...mockMessageData, isCreatedByUser: false },
++          { contextUpdates: updates },
++        );
++        expect(await readStored()).not.toHaveProperty('contextUpdates');
++      });
++
++      it('replaces the entries when a regeneration re-saves the message', async () => {
++        await saveMessage(
++          mockCtx,
++          { ...mockMessageData, isCreatedByUser: true },
++          { contextUpdates: updates },
++        );
++        await saveMessage(
++          mockCtx,
++          { ...mockMessageData, isCreatedByUser: true },
++          { contextUpdates: [] },
++        );
++        expect((await readStored())?.contextUpdates).toEqual([]);
++      });
++
++      it('keeps the entries when a later save carries none', async () => {
++        await saveMessage(
++          mockCtx,
++          { ...mockMessageData, isCreatedByUser: true },
++          { contextUpdates: updates },
++        );
++        await saveMessage(mockCtx, { ...mockMessageData, isCreatedByUser: true, text: 'Edited' });
++        expect((await readStored())?.contextUpdates).toEqual(updates);
++      });
++
+       it("stores a segment anchor once, on the owner's message only", async () => {
+         await saveMessage(mockCtx, { ...mockMessageData, isCreatedByUser: false });
+         await expect(
+@@ -552,6 +585,13 @@ describe('Message Operations', () => {
+         const stored = await Message.findOne({ messageId: 'msg123' }).lean();
+         expect(stored?.createdAt).toEqual(turnStartedAt);
+       });
++
++      it('leaves the automatic stamp in place without the option', async () => {
++        const before = Date.now();
++        await saveMessage(mockCtx, { ...mockMessageData, createdAt: new Date('2020-01-01') });
++        const stored = await Message.findOne({ messageId: 'msg123' }).lean();
++        expect(stored?.createdAt?.getTime()).toBeGreaterThanOrEqual(before);
++      });
+     });
+ 
+     it('bounds aggregate App BSON without changing canonical output, even on a later full save', async () => {
