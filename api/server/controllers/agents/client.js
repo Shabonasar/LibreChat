@@ -1,3 +1,4 @@
+const { GraphEvents } = require('@librechat/agents');
 const { getMCPRequestContext } = require('~/server/services/MCPRequestContext');
 require('events').EventEmitter.defaultMaxListeners = 100;
 const { logger, MAX_AGENT_EVENT_ACTOR_ENCODING_LENGTH } = require('@librechat/data-schemas');
@@ -51,6 +52,8 @@ const {
   computeAgentRequestFingerprint,
   computeLegacyAgentRequestFingerprint,
   getRunDiscoveredTools,
+  captureAuthoredSkills,
+  restoreAuthoredSkills,
   captureResumeModelParameters,
   pickResumeContext,
   getApprovalTtlMs,
@@ -542,8 +545,11 @@ class AgentClient extends BaseClient {
     const currentAttachments = this.options.attachments ? await this.options.attachments : [];
     const compatibleHistoricalAttachments =
       this.getModelBoundAttachmentsForEndpoint(historicalAttachments);
-    const compatibleCurrentAttachments =
-      this.getModelBoundAttachmentsForEndpoint(currentAttachments);
+    /* A tool file refreshed this turn is replayed with its message; count it once. */
+    const replayedFileIds = collectFileIds(compatibleHistoricalAttachments);
+    const compatibleCurrentAttachments = this.getModelBoundAttachmentsForEndpoint(
+      currentAttachments,
+    ).filter((file) => !replayedFileIds.has(file?.file_id));
     this.turnSteerAttachmentHistory = undefined;
     this.turnHistoricalAttachmentIds = collectHistoricalAttachmentIds(
       historicalAttachments,
@@ -2499,6 +2505,12 @@ class AgentClient extends BaseClient {
     const requestAttachments = requestAttachmentsSource ? await requestAttachmentsSource : [];
     const modelBoundRequestAttachments =
       this.getModelBoundAttachmentsForEndpoint(requestAttachments);
+    /* A tool file the turn refreshes keeps its text and media in the message it was
+     * attached to; the latest message only takes files no earlier message carries. */
+    const replayedFileIds = collectFileIds(Object.values(this.message_file_map ?? {}).flat());
+    const isNotReplayed = (file) => !replayedFileIds.has(file?.file_id);
+    const turnAttachments = requestAttachments.filter(isNotReplayed);
+    const turnModelBoundAttachments = modelBoundRequestAttachments.filter(isNotReplayed);
     const retainedHistoricalFileContexts =
       this.options.resendFiles === false
         ? orderedMessages
@@ -2514,7 +2526,7 @@ class AgentClient extends BaseClient {
     const sharedAttachmentFiles = [
       ...Object.values(this.message_file_map ?? {}).flat(),
       ...(this.modelBoundHistoricalSteerFiles ?? []),
-      ...modelBoundRequestAttachments,
+      ...turnModelBoundAttachments,
     ];
     const sharedRunAttachmentIds = collectFileIds(sharedAttachmentFiles);
     this.options.agentContextAttachmentsByAgentId = resolveScopedTurnAttachments({
@@ -2580,8 +2592,8 @@ class AgentClient extends BaseClient {
 
     if (requestAttachmentsSource) {
       const attachments = this.getProcessableAttachmentsForEndpoint(
-        requestAttachments,
-        modelBoundRequestAttachments,
+        turnAttachments,
+        turnModelBoundAttachments,
       );
       const latestMessage = orderedMessages[orderedMessages.length - 1];
       this.modelBoundCurrentFiles = [...modelBoundRequestAttachments];
@@ -2599,20 +2611,20 @@ class AgentClient extends BaseClient {
       /** Agent-scoped extraction only depends on the shared attachment IDs. */
       agentScopedContextPromise = startAgentScopedContext();
 
-      if (this.message_file_map) {
-        this.message_file_map[latestMessage.messageId] = attachments;
-      } else {
-        this.message_file_map = {
-          [latestMessage.messageId]: attachments,
-        };
-      }
+      this.message_file_map ??= {};
+      this.message_file_map[latestMessage.messageId] = [
+        ...(this.message_file_map[latestMessage.messageId] ?? []),
+        ...attachments,
+      ];
 
       const [, files] = await Promise.all([
-        this.addFileContextToMessage(latestMessage, modelBoundRequestAttachments),
+        this.addFileContextToMessage(latestMessage, turnModelBoundAttachments),
         this.processAttachments(latestMessage, attachments),
       ]);
 
-      this.options.attachments = files;
+      this.options.attachments = files.concat(
+        requestAttachments.filter((file) => !isNotReplayed(file)),
+      );
     } else {
       agentScopedContextPromise = startAgentScopedContext();
     }
@@ -2924,7 +2936,7 @@ class AgentClient extends BaseClient {
       }
     }
     /** After the steer stamp, which adds replayed steers' documents of its own. */
-    dedupeDocumentNames(payload);
+    dedupeDocumentNames(payload, agentsById.values());
     messages = orderedMessages;
     promptTokens = promptTokenTotal;
 
@@ -4306,6 +4318,7 @@ class AgentClient extends BaseClient {
     const pauseProjection = {
       expectedCreatedAt: this.jobCreatedAt,
       ...(staged.discoveredTools.length > 0 ? { discoveredTools: staged.discoveredTools } : {}),
+      authoredSkills: staged.authoredSkills,
       ...(staged.activityPhaseSnapshot == null
         ? {}
         : { activityPhaseSnapshot: staged.activityPhaseSnapshot }),
@@ -4606,6 +4619,9 @@ class AgentClient extends BaseClient {
       interruptId: interrupt.interruptId,
       interruptType: interrupt.payload.type,
       discoveredTools,
+      authoredSkills: captureAuthoredSkills(
+        this.options.eventHandlers?.[GraphEvents.ON_TOOL_EXECUTE],
+      ),
       activityPhaseSnapshot: this.activityPhaseWiring?.snapshot?.(),
       compactionSemanticIndex: createCompactionSemanticIndexProjection(
         this.compactionSemanticIndexSnapshot,
@@ -5521,9 +5537,14 @@ class AgentClient extends BaseClient {
     commandOptions,
     userMCPAuthMap,
     discoveredToolNames,
+    authoredSkills,
     activityPhaseSnapshot,
     compactionSemanticIndex,
   }) {
+    restoreAuthoredSkills(
+      this.options.eventHandlers?.[GraphEvents.ON_TOOL_EXECUTE],
+      authoredSkills,
+    );
     /** The seeded state is on the job before the run is rebuilt, so a Stop
      * during rebuild still persists it onto the stopped response. */
     await this.publishRunContextMeta?.();
