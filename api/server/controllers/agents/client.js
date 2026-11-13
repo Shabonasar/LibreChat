@@ -139,6 +139,7 @@ const {
   loadAgent: loadAgentFn,
   createMultiAgentMapper,
   attachProviderItems,
+  getReasoningReplayTarget,
   filterMalformedContentParts,
   countFormattedMessageTokens,
   prependFileContext,
@@ -4902,8 +4903,17 @@ class AgentClient extends BaseClient {
       }
       const hasMessageFormatOptions =
         needsReasoningContentFormat || freshSkillPrimeNames.size > 0 || useLegacyContent;
+      /** With `stableContext`, signed Anthropic reasoning of earlier turns goes back as it was
+       *  sent, to the model that signed it only. */
+      const reasoningReplayTarget = getReasoningReplayTarget(
+        this.options.req?.config,
+        this.options.agent,
+      );
       const formatOptions = {
         ...messageFormatOptions,
+        ...(reasoningReplayTarget != null
+          ? { replayProviderReasoning: reasoningReplayTarget }
+          : {}),
         compactionSemanticIndex: {
           ...(this.eventActorContinuation === 'warm' && this.compactionSemanticIndexSnapshot != null
             ? { baseSnapshot: this.compactionSemanticIndexSnapshot }

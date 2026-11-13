@@ -41,6 +41,7 @@ const {
   collectToolCallIds,
   createToolTimingAdapter,
   stampCommandExecutor,
+  omitReasoningReplayFromDelta,
   writeGuarded,
 } = require('@librechat/api');
 const { processFileCitations } = require('~/server/services/Files/Citations');
@@ -673,10 +674,11 @@ function getDefaultHandlers({
        */
       handle: async (event, data, metadata) => {
         aggregateContent({ event, data });
+        const forwarded = omitReasoningReplayFromDelta(data);
         if (checkIfLastAgent(metadata?.last_agent_id, metadata?.langgraph_node)) {
-          await emitForJob({ event, data });
+          await emitForJob({ event, data: forwarded });
         } else if (!metadata?.hide_sequential_outputs) {
-          await emitForJob({ event, data });
+          await emitForJob({ event, data: forwarded });
         }
       },
     },

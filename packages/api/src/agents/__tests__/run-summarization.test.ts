@@ -4561,6 +4561,46 @@ async function callAndCaptureRunConfig({
   return createMock.mock.calls[0][0] as Record<string, unknown>;
 }
 
+describe('signed reasoning capture', () => {
+  const stable = {
+    endpoints: { agents: { promptCache: { stableContext: true } } },
+  } as unknown as AppConfig;
+  const primaryInput = (runConfig: Record<string, unknown>): Record<string, unknown> =>
+    (runConfig.graphConfig as { agents: Array<Record<string, unknown>> }).agents[0];
+
+  it.each([
+    ['the Anthropic API', {}],
+    ['a proxy of the Anthropic API', { clientOptions: { baseURL: 'https://proxy.test' } }],
+  ])('asks the SDK to capture it for %s with stableContext', async (_name, client) => {
+    const runConfig = await callAndCaptureRunConfig({
+      overrides: {
+        provider: 'anthropic',
+        endpoint: 'anthropic',
+        model_parameters: { model: 'model-1', ...client },
+      },
+      appConfig: stable,
+    });
+    expect(primaryInput(runConfig).providerReasoningReplay).toBe(true);
+  });
+
+  it.each([
+    ['the lever is off', 'anthropic', undefined, {}],
+    ['the provider does not sign reasoning', 'openAI', stable, {}],
+    ['the provider is Bedrock', 'bedrock', stable, {}],
+    ['Anthropic runs on Vertex AI', 'anthropic', stable, { createClient: () => ({}) }],
+  ])('does not when %s', async (_name, provider, appConfig, client) => {
+    const runConfig = await callAndCaptureRunConfig({
+      overrides: {
+        provider,
+        endpoint: provider,
+        model_parameters: { model: 'model-1', ...client },
+      },
+      appConfig,
+    });
+    expect(primaryInput(runConfig)).not.toHaveProperty('providerReasoningReplay');
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Suite: Langfuse run config
 // ---------------------------------------------------------------------------

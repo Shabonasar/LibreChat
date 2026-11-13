@@ -138,6 +138,7 @@ import { getProviderConfig } from '~/endpoints/config/providers';
 import { shareDeferredDefinitions } from '~/agents/deferral';
 import { buildToolApprovalHooks } from '~/agents/hitl/hooks';
 import { getAgentCheckpointer } from '~/agents/checkpointer';
+import { callsAnthropicMessagesApi, replaysSignedReasoning } from './reasoningReplay';
 import { getPluginHookSource } from '~/agents/hooks/source';
 import { getOpenAIConfig } from '~/endpoints/openai/config';
 import { createStepBudgetHook } from '~/agents/stepBudget';
@@ -2798,6 +2799,12 @@ export async function createRun({
           provider,
           promptCache: 'promptCache' in llmConfig && llmConfig.promptCache === true,
         }) || undefined,
+      /** Signed reasoning is captured only for stored conversations, never for isolated subagents. */
+      ...(!isSubagent &&
+        replaysSignedReasoning(appConfig, provider) &&
+        callsAnthropicMessagesApi(llmConfig) && {
+          providerReasoningReplay: true,
+        }),
       name: agent.name ?? undefined,
       toolRegistry,
       maxContextTokens: effectiveMaxContextTokens,
