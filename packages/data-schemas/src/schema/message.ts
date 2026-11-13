@@ -158,6 +158,8 @@ const messageSchema: Schema<IMessage> = new Schema(
       default: undefined,
       meiliIndex: true,
     },
+    /** Server-written by `saveMessage`; encrypted reasoning, so it stays out of every ordinary read. */
+    providerItems: { type: Schema.Types.Mixed, select: false },
     thread_id: {
       type: String,
     },

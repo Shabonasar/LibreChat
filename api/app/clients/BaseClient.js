@@ -1267,7 +1267,8 @@ class BaseClient {
       ? ' +contextUpdates +contextAnchor'
       : '';
     const messages = await loadHistoryRows({
-      getMessages: (filter, select) => db.getMessages(filter, select + stableContextFields),
+      getMessages: (filter, select) =>
+        db.getMessages(filter, `${select}${stableContextFields} +providerItems`),
       user: this.user,
       conversationId,
       parentMessageId,
