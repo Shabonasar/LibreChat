@@ -8073,6 +8073,68 @@ describe('AgentClient - titleConvo', () => {
         );
       });
 
+      it('binds the anchored MCP tools and instructions, and defers a server selected since', async () => {
+        const mcpTool = (server) => ({
+          name: `query_mcp_${server}`,
+          description: `Queries ${server}.`,
+          parameters: { type: 'object', properties: {} },
+          serverName: server,
+        });
+        mockAgent.toolDefinitions = [mcpTool('beta'), mcpTool('alpha')];
+        mockAgent.toolRegistry = new Map(mockAgent.toolDefinitions.map((d) => [d.name, d]));
+        mockAgent.selectedToolNames = ['sys__all__sys_mcp_alpha', 'sys__all__sys_mcp_beta'];
+        const { MCPServersRegistry } = jest.requireActual('@librechat/api');
+        const registrySpy = jest.spyOn(MCPServersRegistry, 'getInstance').mockReturnValue({
+          getAllServerConfigs: async () => ({
+            alpha: { serverInstructions: 'Alpha rule.' },
+            beta: { serverInstructions: 'Beta rule.' },
+          }),
+          getUserHiddenServerNames: async () => new Set(),
+        });
+        models().getConvoContextAnchor.mockResolvedValue([
+          ...ANCHOR,
+          {
+            key: 'tool:mcp:alpha',
+            value: JSON.stringify({
+              instructions: 'Alpha rule.',
+              tools: [
+                {
+                  name: 'query_mcp_alpha',
+                  description: 'Queries alpha.',
+                  parameters: { type: 'object', properties: {} },
+                },
+              ],
+            }),
+          },
+        ]);
+
+        let result;
+        try {
+          result = await client.buildMessages(conversationHistory(), 'msg-3', {});
+        } finally {
+          registrySpy.mockRestore();
+        }
+
+        expect(promptText(result.prompt[2])).toContain(
+          'Tools of MCP server `beta` are now available.',
+        );
+        expect(promptText(result.prompt[2])).toContain('Beta rule.');
+        expect(mockReq.turnContextUpdates.entries.map(({ key }) => key)).toEqual([
+          'tool:mcp:beta',
+          'date',
+        ]);
+        expect(mockAgent.toolDispatch).toBe(true);
+        expect(
+          mockAgent.toolDefinitions.map(({ name, defer_loading }) => [name, defer_loading]),
+        ).toEqual([
+          ['query_mcp_beta', true],
+          ['query_mcp_alpha', undefined],
+        ]);
+        expect(mockAgent.instructions).toContain('Alpha rule.');
+        expect(mockAgent.instructions).not.toContain('Beta rule.');
+        expect(mockFormatInstructions).not.toHaveBeenCalled();
+      });
+
       it('stamps the sent message and replays stored send times when timestamps are on', async () => {
         mockReq.config.endpoints = {
           [EModelEndpoint.agents]: {
@@ -8108,12 +8170,28 @@ describe('AgentClient - titleConvo', () => {
             { key: 'project', value: PROJECT },
             { key: 'runtime:web_search', value: WEB_SEARCH },
             { key: 'date', value: '2026-03-10 (Tuesday)' },
+            { key: 'segment:model', value: JSON.stringify(['openAI', 'openAI', 'gpt-4']) },
+            { key: 'segment:agent', value: expect.any(String) },
+            { key: 'segment:provider_tools', value: '[]' },
           ],
         });
         expect(result.prompt[2].content).toBe('Next question');
         expect(mockAgent.additional_instructions).toBe(
           `${PROJECT}\n\n${WEB_SEARCH}\n\nCurrent date: 2026-03-10 (Tuesday)`,
         );
+      });
+
+      it('reports the reset on the reply when the provider has a prompt cache', async () => {
+        mockAgent.provider = 'anthropic';
+        mockAgent.model_parameters = { model: 'claude-sonnet-4-5', promptCache: true };
+        models().getConvoContextAnchor.mockResolvedValue([
+          ...ANCHOR,
+          { key: 'segment:model', value: JSON.stringify(['anthropic', 'anthropic', 'claude-old']) },
+        ]);
+
+        await client.buildMessages(conversationHistory(), 'msg-3', {});
+
+        expect(client.buildResponseMetadata()).toEqual({ promptCacheReset: ['model'] });
       });
 
       it('keeps the anchored system prompt and announces toggles in the sent message', async () => {
@@ -8177,7 +8255,13 @@ describe('AgentClient - titleConvo', () => {
         expect(client.pendingContextAnchor).toEqual({
           messageId: 'msg-2',
           conversationId: 'convo-123',
-          anchor: [...ANCHOR, { key: 'artifacts', value: 'default' }],
+          anchor: [
+            ...ANCHOR,
+            { key: 'artifacts', value: 'default' },
+            { key: 'segment:model', value: JSON.stringify(['openAI', 'openAI', 'gpt-4']) },
+            { key: 'segment:agent', value: expect.any(String) },
+            { key: 'segment:provider_tools', value: '[]' },
+          ],
         });
         expect(mockAgent.additional_instructions).toContain(artifactsPrompt);
         expect(JSON.stringify(result.prompt)).not.toContain('<context_update>');
