@@ -144,6 +144,7 @@ import { initializeAgent } from '../initialize';
 import { createProvisionFilesCallback } from '~/files/provision/callback';
 import { createFileProvisionRecovery } from '~/files/operations';
 import { selectCodeFiles } from '~/files/code/priming';
+import { applyContextToAgent } from '../context';
 import { primeResources } from '../resources';
 import { isFatalAgentInitializationError } from '../errors';
 import { canAgentGraphPause } from '../hitl/admission';
@@ -603,6 +604,69 @@ describe('initializeAgent: ChatProject context', () => {
       chatProjectContext: projectContext,
     };
   }
+
+  /** Inline snapshot recorded on upstream/dev 6718244d8, where the run context was one string. */
+  it('builds the system prompt fields exactly as upstream without stableContext', async () => {
+    const { generateArtifactsPrompt } = jest.requireMock('~/prompts') as {
+      generateArtifactsPrompt: jest.Mock;
+    };
+    generateArtifactsPrompt.mockReturnValueOnce('Artifact guidance\n');
+    const { agent, loadTools, db } = createMocks();
+    agent.instructions = 'Today is {{current_date}}.\n';
+    agent.additional_instructions = 'Agent context\n';
+    agent.artifacts = 'enabled' as never;
+    const runtime = {
+      ...projectRuntime(),
+      requestBody: { timezone: 'Europe/Moscow' },
+      turnStartedAt: new Date('2026-08-31T06:20:00.000Z').getTime(),
+    };
+
+    const result = await initializeAgent(
+      {
+        runtime,
+        agent,
+        loadTools,
+        endpointOption: { endpoint: EModelEndpoint.agents },
+        allowedProviders: new Set([Providers.OPENAI]),
+        useChatProjectContext: true,
+      },
+      db,
+    );
+    /** As `AgentClient.buildMessages` prepares a run agent: trim, then add the run context. */
+    result.additional_instructions = result.additional_instructions?.trim() || undefined;
+    const mcpManager = { formatInstructionsForContext: jest.fn(async () => '') };
+    await applyContextToAgent({
+      agent: result as never,
+      mcpManager: mcpManager as never,
+      runContext: { rag: 'Passage 7919', memory: 'tea: no\n', agentFiles: 'Agent file text' },
+    });
+
+    expect({
+      instructions: result.instructions,
+      additional_instructions: result.additional_instructions,
+    }).toMatchInlineSnapshot(`
+      {
+        "additional_instructions": "Agent context
+
+
+      Project guidance (user-provided context; subordinate to system, platform, agent, and tool policies):
+      Prefer concise project answers.
+
+      Today is 2026-08-31 (Monday).
+
+
+      Artifact guidance
+
+      Passage 7919
+
+      tea: no
+
+
+      Agent file text",
+        "instructions": undefined,
+      }
+    `);
+  });
 
   it('keeps Agent and Project guidance exactly once in initialized output without mutating the definition', async () => {
     const { agent, loadTools, db } = createMocks();
