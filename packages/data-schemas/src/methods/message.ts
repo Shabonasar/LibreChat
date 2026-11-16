@@ -7,9 +7,9 @@ import {
 import type { ClientSession, DeleteResult, FilterQuery, Model, Types, UpdateQuery } from 'mongoose';
 import type { UserSubmittedMessageFieldPath } from 'librechat-data-provider';
 import type { SearchParams } from 'meilisearch';
+import type { AppConfig, IContextEntry, IConversation, IMessage } from '~/types';
 import type { SchemaWithMeiliMethods } from '~/models/plugins/mongoMeili';
 import type { ISubagentContentChunk } from '~/models/subagentContent';
-import type { AppConfig, IConversation, IMessage } from '~/types';
 import { createChatExpirationDate, createTempChatExpirationDate } from '~/utils/tempChatRetention';
 import { activeExpirationFilter, createFallbackRetentionDate } from '~/utils/retention';
 import { fitBoundAppSnapshots, hasBoundAppSnapshots } from './appSnapshots';
@@ -32,6 +32,12 @@ const MAX_SUBAGENT_CONTROL_MESSAGE_LENGTH = 4 * 1024;
  * writer therefore has enough rounds for every admitted receipt to converge. */
 const MAX_SUBAGENT_CONTROL_RECEIPT_CAS_ATTEMPTS = 64;
 const HITL_MESSAGE_FILTER_FIELD_SET = new Set<string>(HITL_MESSAGE_FILTER_FIELDS);
+
+/** Written only through `saveMessage` metadata and `setMessageContextAnchor`, never from input. */
+function stripContextFields(record: Record<string, unknown>): void {
+  delete record.contextUpdates;
+  delete record.contextAnchor;
+}
 
 function normalizeUserSubmittedPaths(paths: unknown): string[] {
   if (!Array.isArray(paths)) {
@@ -805,6 +811,8 @@ export interface MessageMethods {
       insertOnly?: boolean;
       /** Creation time to store when this save inserts the row; an existing row keeps its own. */
       createdAtOnInsert?: Date;
+      /** Context changes announced with this user message; the only way to write them. */
+      contextUpdates?: IContextEntry[];
     },
   ): Promise<IMessage | null | undefined>;
   /**
@@ -873,6 +881,16 @@ export interface MessageMethods {
     overrideTimestamp?: boolean,
     provenance?: { privateTextTokens: ReadonlyMap<string, readonly string[]> },
   ): Promise<unknown>;
+  /**
+   * Stores the anchor of the context segment a summary opens, on the user's message carrying it.
+   * A stored anchor is never replaced: concurrent turns cannot move one in use.
+   * @returns whether the message now holds an anchor
+   */
+  setMessageContextAnchor(input: {
+    user: string;
+    messageId: string;
+    anchor: IContextEntry[];
+  }): Promise<boolean>;
   updateToolCallResult(params: {
     userId: string;
     messageId: string;
@@ -1264,6 +1282,8 @@ export function createMessageMethods(
       insertOnly?: boolean;
       /** Creation time to store when this save inserts the row; an existing row keeps its own. */
       createdAtOnInsert?: Date;
+      /** Context changes announced with this user message; the only way to write them. */
+      contextUpdates?: IContextEntry[];
     },
   ) {
     if (!userId) {
@@ -1288,6 +1308,10 @@ export function createMessageMethods(
       delete update.privateText;
       delete update.privacyRevision;
       delete update.privateTextTokens;
+      stripContextFields(update);
+      if (metadata?.contextUpdates != null && params.isCreatedByUser === true) {
+        update.contextUpdates = metadata.contextUpdates;
+      }
       if (metadata?.privateText != null) {
         if (params.isCreatedByUser !== true || typeof params.text !== 'string') {
           throw new Error('Private text requires a user message.');
@@ -1520,6 +1544,7 @@ export function createMessageMethods(
         delete normalizedMessage.privateText;
         delete normalizedMessage.privacyRevision;
         delete normalizedMessage.privateTextTokens;
+        stripContextFields(normalizedMessage);
         const tokens = provenance?.privateTextTokens.get(String(message.messageId));
         const text = message.text;
         if (
@@ -2648,6 +2673,27 @@ export function createMessageMethods(
       : !remaining.some((result) => taskIds.includes(result.taskId));
   }
 
+  async function setMessageContextAnchor({
+    user,
+    messageId,
+    anchor,
+  }: {
+    user: string;
+    messageId: string;
+    anchor: IContextEntry[];
+  }): Promise<boolean> {
+    const Message = mongoose.models.Message as Model<IMessage>;
+    const result = await Message.updateOne(
+      { messageId, user, contextAnchor: { $exists: false } },
+      { $set: { contextAnchor: anchor } },
+      { timestamps: false },
+    );
+    if (result.modifiedCount === 1) {
+      return true;
+    }
+    return (await Message.exists({ messageId, user, contextAnchor: { $exists: true } })) != null;
+  }
+
   /**
    * Updates a message and returns sanitized fields.
    */
@@ -2661,6 +2707,7 @@ export function createMessageMethods(
       delete update.privateText;
       delete update.privacyRevision;
       delete update.privateTextTokens;
+      stripContextFields(update);
       const updatedMessage = await writeMessage({ messageId, user: userId }, update, {
         upsert: false,
         unsetPrivateText: Object.prototype.hasOwnProperty.call(update, 'text'),
@@ -4520,6 +4567,7 @@ export function createMessageMethods(
     getPrivateMessageTexts,
     saveMessage,
     bulkSaveMessages,
+    setMessageContextAnchor,
     updateToolCallResult,
     claimBackgroundToolResults,
     confirmBackgroundToolResultClaim,
