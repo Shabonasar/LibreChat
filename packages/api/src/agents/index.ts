@@ -56,6 +56,7 @@ export * from './ptc';
 export * from './openai';
 export * from './transactions';
 export * from './traversal';
+export * from './reasoningReplay';
 export * from './usage';
 export * from './resources';
 export * from './responses';
