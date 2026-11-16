@@ -12,6 +12,7 @@ const {
   sanitizeTitle,
   payloadParser,
   createSafeUser,
+  createSafeAgent,
   initializeAgent,
   resolveConfigHeaders,
   resolveRequestTenantId,
@@ -29,6 +30,7 @@ const {
   getScheduleMCPExecution,
   createScheduledMCPPolicyRecorder,
   recordFallbackTokenUsage,
+  getAgentPromptTokenEstimate,
   createDetachedSubagentUsageRecorder,
   sendEvent,
   computeUsageCostUSD,
@@ -222,6 +224,8 @@ const {
   getChatProjectContextKey,
   isTemporaryTurn,
   hasEntityEmbeddings,
+  restoreGoogleThoughtSignatures,
+  getGoogleHistoryFormatOptions,
 } = require('@librechat/api');
 const {
   Run,
@@ -695,11 +699,7 @@ class AgentClient extends BaseClient {
     this.stepMap = stepMap;
     /** @type {Array<UsageMetadata>} */
     this.collectedUsage = collectedUsage;
-    /** Vertex Gemini 3 thought signatures captured during the run, keyed by
-     *  `tool_call_id`. Persisted on `responseMessage.metadata.thoughtSignatures`
-     *  and restored as `additional_kwargs.signatures` on subsequent turns to
-     *  keep tool round-trips valid across DB reconstruction.
-     *  @type {Record<string, string> | undefined} */
+    /** @type {import('@librechat/api').GoogleThoughtSignatures | undefined} */
     this.collectedThoughtSignatures = collectedThoughtSignatures;
     /** @type {ArtifactPromises} */
     this.artifactPromises = artifactPromises;
@@ -2966,7 +2966,10 @@ class AgentClient extends BaseClient {
     ]);
 
     this.retainedAnswers = await retainedAnswersPromise;
-    promptTokens += this.retainedAnswers.tokenCount;
+    promptTokens = getAgentPromptTokenEstimate(
+      promptTokens + this.retainedAnswers.tokenCount,
+      this.maxContextTokens,
+    );
 
     /** Context changes since the segment's anchor, prepended to the prompt copy only and
      *  counted for the prompt. Planned here, once memory has loaded. */
@@ -3591,6 +3594,7 @@ class AgentClient extends BaseClient {
       req: this.options.req,
       res: this.options.res,
       user: createSafeUser(this.options.req.user),
+      primaryAgent: createSafeAgent(this.options.agent),
       tenantId: resolveRequestTenantId(this.options.req),
     });
 
@@ -3813,14 +3817,14 @@ class AgentClient extends BaseClient {
    * which rebuild the gauge breakdown and branch/total cost across reloads.
    * Returns undefined when nothing was captured.
    * @returns {{
-   *   thoughtSignatures?: Record<string, string>,
+   *   thoughtSignatures?: import('@librechat/api').GoogleThoughtSignatures,
    *   contextUsage?: import('librechat-data-provider').TContextUsageEvent,
    *   usage?: import('librechat-data-provider').TResponseUsage,
    * } | undefined}
    */
   buildResponseMetadata() {
     /** @type {{
-     *   thoughtSignatures?: Record<string, string>,
+     *   thoughtSignatures?: import('@librechat/api').GoogleThoughtSignatures,
      *   contextUsage?: import('librechat-data-provider').TContextUsageEvent,
      *   usage?: import('librechat-data-provider').TResponseUsage,
      *   promptCacheReset?: string[],
@@ -4900,6 +4904,7 @@ class AgentClient extends BaseClient {
         ...(this.agentConfigs?.values() ?? []),
       ]);
       const messageFormatOptions = {
+        ...getGoogleHistoryFormatOptions(reachableAgents),
         ...(needsReasoningContentFormat ? { preserveReasoningContent: true } : {}),
         ...(freshSkillPrimeNames.size > 0 ? { skipSkillBodyNames: freshSkillPrimeNames } : {}),
         ...(useLegacyContent ? { legacyContent: true } : {}),
@@ -4953,6 +4958,11 @@ class AgentClient extends BaseClient {
         toolSet,
         skillPrimeResult?.skills,
         formatOptions,
+      );
+      restoreGoogleThoughtSignatures(
+        initialMessages,
+        this.modelBoundStoredMessages ?? [],
+        reachableAgents,
       );
       if (this.eventActorContinuation !== 'warm') {
         this.eventActorSummary = initialSummary;
@@ -5994,6 +6004,7 @@ class AgentClient extends BaseClient {
         activityPhase?.handlers(offsetHandlers) ??
         (activityLabel ? createAssistantPhaseStampingHandlers(offsetHandlers) : offsetHandlers);
       run = await createRun({
+        sdkResumeState: { content: seedContent, steps: runSteps },
         scheduledMCPExecution: getScheduleMCPExecution(getMCPRequestContext(this.options.req)),
         recordScheduledMCPDenial: createScheduledMCPPolicyRecorder(
           getScheduleMCPExecution(getMCPRequestContext(this.options.req)),
@@ -6422,6 +6433,7 @@ class AgentClient extends BaseClient {
         conversationId: this.conversationId,
         parentMessageId: this.parentMessageId,
       },
+      agent: createSafeAgent(this.options.agent),
     });
 
     try {
@@ -6523,6 +6535,8 @@ class AgentClient extends BaseClient {
         usage,
         context,
         collectedUsage: this.collectedUsage,
+        contentParts: this.contentParts,
+        maxContextTokens: this.maxContextTokens,
         aborted: this.abortController?.signal?.aborted === true,
         promptTokens,
         completionTokens,
