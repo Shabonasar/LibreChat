@@ -26,6 +26,7 @@ const {
   createAskUserQuestionTool,
   ASK_USER_QUESTION_TOOL_NAME,
   resolveWebSearchSSRFAgents,
+  resolveHeaders,
   buildWebSearchDynamicContext,
   getPromptTime,
   codeExecutionAuthHeaders,
@@ -415,6 +416,9 @@ const loadTools = async ({
         result.authResult,
         webSearch?.allowedAddresses,
       );
+      const resolveUserHeaders = (headers) =>
+        resolveHeaders({ headers, user: options.req?.user, stripUnresolved: true });
+      const { searxngSearchOptions } = result.authResult;
       requestedTools[tool] = async () => {
         toolContextMap[tool] = buildWebSearchContext();
         dynamicToolContextMap[tool] = buildWebSearchDynamicContext(
@@ -422,6 +426,11 @@ const loadTools = async ({
         );
         return createSearchTool({
           ...result.authResult,
+          rerankerHeaders: resolveUserHeaders(webSearch?.rerankerHeaders),
+          searxngSearchOptions: searxngSearchOptions && {
+            ...searxngSearchOptions,
+            headers: resolveUserHeaders(searxngSearchOptions.headers),
+          },
           httpAgent,
           httpsAgent,
           onSearchResults,
