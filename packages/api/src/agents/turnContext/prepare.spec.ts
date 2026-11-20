@@ -43,6 +43,23 @@ describe('prepareTurnContext', () => {
       anchorPromise: Promise.resolve(ANCHOR),
     });
 
+  it('does not plan when the hidden servers cannot be read, which would bind hidden schemas', async () => {
+    const reader = jest.fn().mockRejectedValue(new Error('config unreadable'));
+    const req = request();
+    await expect(
+      prepareTurnContext({
+        req,
+        agent: agent(),
+        allAgents: [{ agent: agent() }],
+        orderedMessages: history(),
+        conversationId: 'c1',
+        anchorPromise: Promise.resolve(ANCHOR),
+        getHiddenServers: reader,
+      }),
+    ).rejects.toThrow('config unreadable');
+    expect(reader).toHaveBeenCalledWith(req.user);
+  });
+
   it('stores the net change on the sent user message', async () => {
     const req = request();
     const prepared = await run(req);
@@ -60,6 +77,49 @@ describe('prepareTurnContext', () => {
     expect(req.turnContextUpdates).toBeUndefined();
     expect(prepared?.plan.currentEntries).toBeUndefined();
     expect(prepared?.plan.updates.get(2)).toContain('Current date: 2026-03-10 (Tuesday)');
+  });
+});
+
+describe('prepareTurnContext without a tool dispatcher in the installed SDK', () => {
+  afterEach(() => {
+    jest.resetModules();
+    jest.dontMock('@librechat/agents');
+    jest.dontMock('@librechat/data-schemas');
+  });
+
+  it('keeps the tools as loaded and the rest of the turn context, and warns once', async () => {
+    const warn = jest.fn();
+    jest.resetModules();
+    jest.doMock('@librechat/agents', () => ({
+      ...jest.requireActual('@librechat/agents'),
+      TOOL_DISPATCHER_NAME: undefined,
+    }));
+    jest.doMock('@librechat/data-schemas', () => ({
+      ...jest.requireActual('@librechat/data-schemas'),
+      logger: { warn, error: jest.fn(), debug: jest.fn(), info: jest.fn() },
+    }));
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { prepareTurnContext: prepare } = require('./prepare') as typeof import('./prepare');
+    const mcpAgent = () => ({
+      ...agent(),
+      toolDefinitions: [{ name: 'search_mcp_alpha', serverName: 'alpha' }],
+    });
+    const turn = () =>
+      prepare({
+        req: request(),
+        agent: mcpAgent(),
+        allAgents: [{ agent: mcpAgent() }],
+        orderedMessages: history(),
+        conversationId: 'c1',
+        anchorPromise: Promise.resolve(ANCHOR),
+        getHiddenServers: async () => new Set(),
+      });
+    const first = await turn();
+    const second = await turn();
+    expect(first?.plan.tools).toBeUndefined();
+    expect(second?.plan.tools).toBeUndefined();
+    expect(first?.plan.currentEntries?.map(({ key }) => key)).toContain('runtime:web_search');
+    expect(warn).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -88,6 +148,37 @@ describe('prepareTurnContext memory', () => {
   it('anchors no memory notice for an agent that cannot use memory while the store is empty', async () => {
     expect(await anchored({ memories: EMPTY })).toBeUndefined();
     expect(await anchored({ memories: EMPTY, inlineTools: true })).toBeDefined();
+  });
+});
+
+describe('prepareTurnContext resets', () => {
+  const agentOf = (provider: string, promptCache: boolean, model: string) => ({
+    provider,
+    model_parameters: { model, promptCache },
+    dynamicToolContextMap: {},
+  });
+  const turn = (agent: ReturnType<typeof agentOf>, anchor: readonly ContextEntry[] | null) =>
+    prepareTurnContext({
+      req: request(),
+      agent,
+      allAgents: [{ agent }],
+      orderedMessages: history(),
+      conversationId: 'c1',
+      anchorPromise: Promise.resolve(anchor),
+    });
+
+  it.each([
+    ['anthropic', true, true],
+    ['openrouter', true, true],
+    ['bedrock', true, true],
+    ['anthropic', false, false],
+    ['openAI', true, false],
+    ['google', true, false],
+  ])('reports a model change for %s with promptCache %s: %s', async (provider, cache, reported) => {
+    const first = await turn(agentOf(provider, cache, 'model-a'), null);
+    const second = await turn(agentOf(provider, cache, 'model-b'), first?.plan.anchor ?? null);
+    expect(second?.plan.reset).toEqual(['model']);
+    expect(second?.promptCacheReset).toEqual(reported ? ['model'] : undefined);
   });
 });
 

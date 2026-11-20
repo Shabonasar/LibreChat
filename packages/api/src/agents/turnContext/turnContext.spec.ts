@@ -149,6 +149,8 @@ const summaryPart = (retainedFromMessageId?: string) => ({
 });
 
 const last = (texts: Array<string | undefined>) => texts[texts.length - 1];
+/** The declared-reset profile every anchor records; it renders nothing. */
+const SEGMENT_KEYS = ['segment:model', 'segment:agent', 'segment:provider_tools'];
 
 describe('planTurnContext', () => {
   const base: State = { project: 'Quote prices in EUR.', memory: 'Likes tea.', webSearch: true };
@@ -162,6 +164,7 @@ describe('planTurnContext', () => {
       'runtime:web_search',
       'date',
       'memory',
+      ...SEGMENT_KEYS,
     ]);
     expect(plan.block).toBe(
       [
@@ -250,7 +253,7 @@ describe('planTurnContext', () => {
         minutes(3),
       );
       expect(plan.anchorTarget).toEqual({ messageId: carrier });
-      expect(plan.anchor).toEqual([
+      expect(plan.anchor.filter(({ key }) => !SEGMENT_KEYS.includes(key))).toEqual([
         { key: 'project', value: 'P2' },
         { key: 'runtime:web_search', value: WEB_SEARCH_RUNTIME },
         { key: 'date', value: '2026-03-09 (Monday)' },

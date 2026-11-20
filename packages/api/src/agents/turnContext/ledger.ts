@@ -8,7 +8,9 @@ import {
   compareContextKeys,
   collectLiveContext,
 } from './registry';
+import type { LiveToolGroups, ToolPlan } from './tools';
 import { findSummarySegment, formatContextUpdate } from '../contextUpdates';
+import { findToolResets, isToolGroupKey, planTools } from './tools';
 import { createAnchor, reanchor, readEntries } from './anchor';
 
 export interface TurnPlan {
@@ -16,6 +18,8 @@ export interface TurnPlan {
   anchor: ContextEntry[];
   /** Set when this turn opened the segment: where to store `anchor` (null: the conversation). */
   anchorTarget?: { messageId: string | null };
+  /** Why this turn re-anchored a segment without a compaction (a declared reset). */
+  reset?: string[];
   /** The `<context_update>` block of each user message that has one, by message index. */
   updates: Map<number, string>;
   /** Entries to store on the user message sent this turn; undefined when none is sent. */
@@ -30,12 +34,15 @@ export interface TurnPlan {
   memoryTexts: string[];
   /** Retrieved file context the request carries, for content inspection. */
   ragTexts: string[];
+  /** The tools this turn binds; undefined when the snapshot sampled no tool groups. */
+  tools?: ToolPlan;
 }
 
 function diffLive(
   known: ReadonlyMap<string, string>,
   live: ReadonlyMap<string, string>,
   withheld: ReadonlySet<string>,
+  unavailable: ReadonlySet<string>,
 ): ContextEntry[] {
   const entries: ContextEntry[] = [];
   for (const key of [...new Set([...known.keys(), ...live.keys()])].sort(compareContextKeys)) {
@@ -50,7 +57,13 @@ function diffLive(
       }
       continue;
     }
-    if (withheld.has(key) || (value == null && source.whenOff === 'silent')) {
+    if (
+      source.resets === true ||
+      withheld.has(key) ||
+      /** Unreachable for now, not switched off: the model keeps knowing it. */
+      (value == null && unavailable.has(key)) ||
+      (value == null && source.whenOff === 'silent')
+    ) {
       continue;
     }
     const previous = known.get(key) ?? null;
@@ -63,18 +76,61 @@ function diffLive(
   return entries;
 }
 
+interface Segment {
+  /** The message that stores the segment's anchor; -1 when the conversation does. */
+  carrier: number;
+  /** The first message whose stored changes the anchor does not include. */
+  eventsFrom: number;
+  /** The first message the model sees. */
+  visibleFrom: number;
+}
+
+/**
+ * The segment the branch ends in. A compaction opens one after its summary; a
+ * declared reset opens one on the user message that stores its anchor.
+ */
+function findSegment(messages: readonly TurnContextMessage[]): Segment {
+  const { carrier, visibleFrom } = findSummarySegment(messages);
+  for (let i = messages.length - 1; i > carrier; i--) {
+    if (messages[i].isCreatedByUser === true && messages[i].contextAnchor != null) {
+      return { carrier: i, eventsFrom: i, visibleFrom };
+    }
+  }
+  return { carrier, eventsFrom: carrier + 1, visibleFrom };
+}
+
 /** The anchor the segment before `carrier` started from, which orders a new one. */
 function previousAnchor(
   messages: readonly TurnContextMessage[],
   carrier: number,
   conversationAnchor: readonly ContextEntry[] | null | undefined,
 ): readonly ContextEntry[] | null | undefined {
-  const earlier = findSummarySegment(messages.slice(0, carrier)).carrier;
+  const earlier = findSegment(messages.slice(0, carrier)).carrier;
   return earlier >= 0 ? messages[earlier].contextAnchor : conversationAnchor;
+}
+
+/**
+ * Changes the anchor cannot absorb as updates: a source that resets, compared
+ * only when the anchor recorded it, and tool changes the dispatcher cannot reach.
+ */
+function findResets(
+  anchor: readonly ContextEntry[],
+  live: ReadonlyMap<string, string>,
+  toolGroups: LiveToolGroups | undefined,
+): string[] {
+  const reasons = anchor
+    .filter(
+      ({ key, value }) =>
+        findContextSource(key)?.resets === true && (live.get(key) ?? null) !== value,
+    )
+    .map(({ key }) => key.slice(ContextSourceKeys.segmentPrefix.length));
+  return [...reasons, ...(toolGroups != null ? findToolResets(anchor, toolGroups) : [])];
 }
 
 interface Fold {
   known: Map<string, string>;
+  /** The last value each key had at some point of the segment, kept after it is switched off. */
+  lastSeen: Map<string, string>;
   withheld: ReadonlySet<string>;
   snapshot: SendSnapshot;
   memoryTexts: string[];
@@ -105,15 +161,18 @@ function renderEntry(
   if (state === previous) {
     return undefined;
   }
+  const wasKnown = fold.lastSeen.has(key);
+  const lastSeen = fold.lastSeen.get(key) ?? null;
   if (state == null) {
     fold.known.delete(key);
   } else {
     fold.known.set(key, state);
+    fold.lastSeen.set(key, state);
   }
   if (fold.withheld.has(key) || (value == null && source.whenOff === 'silent')) {
     return undefined;
   }
-  const line = source.renderUpdate(key, value, previous, fold.snapshot.agent);
+  const line = source.renderUpdate(key, value, previous, fold.snapshot.agent, wasKnown, lastSeen);
   if (key === ContextSourceKeys.memory && value != null) {
     fold.memoryTexts.push(line);
   }
@@ -133,7 +192,10 @@ function renderEntry(
  * A segment without a stored anchor is anchored to the live state this turn:
  * the conversation's first turn, the first turn after a compaction (keeping
  * the previous anchor's order), or the first turn of a conversation started
- * before anchors existed.
+ * before anchors existed. A sent message whose live state breaks the prefix
+ * anyway (another model, agent setup or provider tools, a schema-profile
+ * option, a tool group the dispatcher cannot reach) re-anchors the segment on
+ * itself the same way, and the plan reports why.
  */
 export function planTurnContext({
   messages,
@@ -146,7 +208,9 @@ export function planTurnContext({
   snapshot: SendSnapshot;
   currentIndex?: number;
 }): TurnPlan {
-  const { carrier, visibleFrom } = findSummarySegment(messages);
+  const segment = findSegment(messages);
+  const { visibleFrom } = segment;
+  let { carrier, eventsFrom } = segment;
   const stored = carrier >= 0 ? messages[carrier].contextAnchor : conversationAnchor;
   const storedAnchor = stored != null ? readEntries(stored) : undefined;
   const sendSnapshot: SendSnapshot = {
@@ -159,7 +223,19 @@ export function planTurnContext({
 
   let anchor: ContextEntry[];
   let anchorTarget: TurnPlan['anchorTarget'];
-  if (storedAnchor != null) {
+  let reset: string[] | undefined;
+  const resets =
+    storedAnchor != null && currentIndex != null
+      ? findResets(storedAnchor, live, snapshot.toolGroups)
+      : [];
+  const currentId = currentIndex != null ? messages[currentIndex]?.messageId : undefined;
+  if (resets.length > 0 && typeof currentId === 'string' && currentId !== '') {
+    anchor = reanchor(storedAnchor, live);
+    anchorTarget = { messageId: currentId };
+    reset = resets;
+    carrier = currentIndex as number;
+    eventsFrom = carrier;
+  } else if (storedAnchor != null) {
     anchor = storedAnchor;
   } else if (carrier < 0) {
     anchor = createAnchor(live);
@@ -178,7 +254,14 @@ export function planTurnContext({
     }
   }
   const withheld = getWithheldKeys(live, known.keys());
-  const fold: Fold = { known, withheld, snapshot: sendSnapshot, memoryTexts: [], ragTexts: [] };
+  const fold: Fold = {
+    known,
+    lastSeen: new Map(known),
+    withheld,
+    snapshot: sendSnapshot,
+    memoryTexts: [],
+    ragTexts: [],
+  };
   const anchorMemory = known.get(ContextSourceKeys.memory);
   if (anchorMemory != null && !withheld.has(ContextSourceKeys.memory)) {
     fold.memoryTexts.push(anchorMemory);
@@ -202,7 +285,12 @@ export function planTurnContext({
     }
     let entries: ContextEntry[];
     if (i === currentIndex) {
-      currentEntries = diffLive(known, live, withheld);
+      currentEntries = diffLive(
+        known,
+        live,
+        withheld,
+        snapshot.toolGroups?.unavailable ?? new Set(),
+      );
       entries = currentEntries;
     } else {
       entries = readEntries(message.contextUpdates);
@@ -213,7 +301,7 @@ export function planTurnContext({
         fold,
         findContextSource(entry.key) as ContextSource,
         entry,
-        i > carrier,
+        i >= eventsFrom,
       );
       if (line) {
         lines.push(line);
@@ -224,9 +312,18 @@ export function planTurnContext({
     }
   }
 
+  /** Bound once the branch has used tool groups, so `tools` stays fixed from then on. */
+  const hasToolGroups = (entries: readonly ContextEntry[] | null | undefined) =>
+    entries?.some(({ key }) => isToolGroupKey(key)) === true;
+  const dispatch =
+    hasToolGroups(anchor) ||
+    hasToolGroups(currentEntries) ||
+    messages.some(({ contextUpdates }, i) => i !== currentIndex && hasToolGroups(contextUpdates));
+
   return {
     anchor,
     anchorTarget,
+    ...(reset != null && { reset }),
     updates,
     currentEntries,
     withheld,
@@ -234,5 +331,10 @@ export function planTurnContext({
     memoryBlock,
     memoryTexts: fold.memoryTexts,
     ragTexts: fold.ragTexts,
+    /** Without any group, now or earlier in the branch, the tools stay as loaded. */
+    tools:
+      snapshot.toolGroups != null && (dispatch || snapshot.toolGroups.groups.size > 0)
+        ? planTools({ agent: snapshot.agent, anchor, toolGroups: snapshot.toolGroups, dispatch })
+        : undefined,
   };
 }
