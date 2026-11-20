@@ -11,6 +11,7 @@ export * from './compaction';
 export * from './contact';
 export * from './context';
 export * from './contextUpdates';
+export * from './turnContext';
 export * from './control';
 export * from './conversation';
 export * from './creates';
@@ -63,6 +64,14 @@ export * from './responses';
 export * from './skills';
 export * from './specs';
 export * from './toggles';
+export {
+  ContextPartKeys,
+  listContextParts,
+  contributeContext,
+  assembleSystemPrompt,
+  assembleAdditionalInstructions,
+} from './systemParts';
+export type { ContextKind, ContextPart, ContextAgent } from './systemParts';
 export * from './phases';
 export * from './stepBudget';
 export * from './startup';

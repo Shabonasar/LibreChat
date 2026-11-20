@@ -1,4 +1,5 @@
 import { Tools, replaceSpecialVars } from 'librechat-data-provider';
+import type { ContextEntry } from './turnContext/registry';
 import type { PromptCacheConfig } from './promptCache';
 import { getPromptTime, isStableContextEnabled } from './promptCache';
 import { isUsableSummaryPart } from './compaction';
@@ -28,15 +29,22 @@ function getRetainedFromMessageId(part: unknown): string | undefined {
   return typeof id === 'string' && id.trim() !== '' ? id.trim() : undefined;
 }
 
+/** Where the latest usable summary splits a branch. */
+export interface SummarySegment {
+  /** Index of the message carrying the summary; -1 when there is none. */
+  carrier: number;
+  /** First message the model still sees. */
+  visibleFrom: number;
+}
+
 /**
- * Index of the first message the model still sees once the latest usable
- * summary replaces the history it covers; 0 when there is no summary. Mirrors
- * the agents SDK formatter: a summary that names `coverage.retainedFromMessageId`
- * (an earlier or the same message) keeps history from that message, any other
- * summary keeps history from the message that carries it.
+ * Locates the latest usable summary of a branch. Mirrors the agents SDK
+ * formatter: a summary that names `coverage.retainedFromMessageId` (an earlier
+ * or the same message) keeps history from that message, any other summary
+ * keeps history from the message that carries it.
  */
-export function findSummaryBoundaryIndex(messages: readonly ContextUpdateMessage[]): number {
-  let boundary = 0;
+export function findSummarySegment(messages: readonly ContextUpdateMessage[]): SummarySegment {
+  const segment: SummarySegment = { carrier: -1, visibleFrom: 0 };
   const indexByMessageId = new Map<string, number>();
   for (let i = 0; i < messages.length; i++) {
     const { messageId, content } = messages[i];
@@ -53,10 +61,28 @@ export function findSummaryBoundaryIndex(messages: readonly ContextUpdateMessage
       const retainedFromMessageId = getRetainedFromMessageId(part);
       const retainedIndex =
         retainedFromMessageId != null ? indexByMessageId.get(retainedFromMessageId) : undefined;
-      boundary = retainedIndex ?? i;
+      segment.carrier = i;
+      segment.visibleFrom = retainedIndex ?? i;
     }
   }
-  return boundary;
+  return segment;
+}
+
+/** The context changes a turn's user message announced, set on the request by `buildMessages`. */
+export interface TurnContextUpdates {
+  messageId: string;
+  entries: ContextEntry[];
+}
+
+/** Entries to store with `messageId` when it is the user message this turn announced them on. */
+export function getTurnContextUpdates(
+  req: { turnContextUpdates?: TurnContextUpdates } | null | undefined,
+  messageId: string | null | undefined,
+): ContextEntry[] | undefined {
+  const updates = req?.turnContextUpdates;
+  return updates != null && messageId != null && updates.messageId === messageId
+    ? updates.entries
+    : undefined;
 }
 
 /** `dynamicToolContextMap` key of agent instructions resolved from temporal special variables. */
@@ -155,7 +181,7 @@ export function buildHistoryContextUpdates({
   const anchor = getPromptTime(req.config, req);
   let lastSeenDate = isValidInstant(anchor) ? format('{{current_date}}', anchor) : undefined;
   const lastIndex = messages.length - 1;
-  for (let i = findSummaryBoundaryIndex(messages); i < messages.length; i++) {
+  for (let i = findSummarySegment(messages).visibleFrom; i < messages.length; i++) {
     const message = messages[i];
     const sentAt = message.createdAt ?? (i === lastIndex ? req.turnStartedAt : undefined);
     if (message.isCreatedByUser !== true || !isValidInstant(sentAt)) {
